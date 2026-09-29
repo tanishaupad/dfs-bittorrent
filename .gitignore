@@ -1,0 +1,9 @@
+client/client
+tracker/tracker
+*.o
+client_*_files.txt
+tracker*_state.txt
+tracker*_pending_sync.txt
+dummy_large.bin
+dummy_downloaded*.bin
+__pycache__/
