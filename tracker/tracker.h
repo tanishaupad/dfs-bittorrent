@@ -50,6 +50,7 @@ public:
     std::vector<std::string> list_requests(const std::string &group_id, const std::string &owner_id, bool &is_owner);
     bool accept_request(const std::string &group_id, const std::string &username, const std::string &owner_id);
     bool upload_file(const std::string &group_id, const std::string &username, const std::string &file_name, size_t file_size, const std::string &file_sha1, const std::vector<std::string> &piece_sha1s);
+    bool register_peer(const std::string &group_id, const std::string &username, const std::string &file_name);
     std::vector<std::string> list_files(const std::string &group_id, const std::string &username, bool &is_member);
     bool download_file(const std::string &group_id, const std::string &username, const std::string &file_name, size_t &file_size, std::string &file_sha1, std::vector<std::string> &piece_sha1s, std::vector<std::pair<std::string, int>> &peers);
     bool stop_share(const std::string &group_id, const std::string &username, const std::string &file_name);

@@ -331,6 +331,20 @@ bool TrackerState::upload_file(const std::string &group_id, const std::string &u
     return true;
 }
 
+bool TrackerState::register_peer(const std::string &group_id, const std::string &username, const std::string &file_name) {
+    std::lock_guard<std::mutex> lock(mtx);
+    auto group = groups.find(group_id);
+    auto file = files.find(group_id + ":" + file_name);
+    auto user = users.find(username);
+    if (group == groups.end() || file == files.end() ||
+        user == users.end() || !user->second.is_logged_in ||
+        group->second.members.count(username) == 0) {
+        return false;
+    }
+    file->second.seeders.insert(username);
+    return true;
+}
+
 std::vector<std::string> TrackerState::list_files(const std::string &group_id, const std::string &username, bool &is_member) {
     std::lock_guard<std::mutex> lock(mtx);
     std::vector<std::string> list;
@@ -648,8 +662,8 @@ std::string handle_command(const std::string &cmd_raw, bool is_sync, std::string
         std::string group_id = tokens[1];
         std::string username = tokens[2];
         std::string file_name = tokens[3];
-        // Register seeder doesn't overwrite piece details, just inserts username as seeder
-        if (state.upload_file(group_id, username, file_name, 0, "", {})) {
+        // A peer may advertise verified pieces before completing the file.
+        if (state.register_peer(group_id, username, file_name)) {
             state.save_to_file(state_file);
             if (!is_sync) queue_sync(cmd_str);
             return "SUCCESS";

@@ -112,6 +112,9 @@ Once a client starts, it presents an interactive prompt `>` accepting the follow
 
 1. **Self-Contained Hashing**: Included a lightweight, dependency-free SHA-1 implementation in `common/` to guarantee smooth compiles on any standard system.
 2. **Hybrid TCP Communication Protocol**: Used text-based headers for C2C/C2T metadata exchange and length-prefixed raw bytes for high-performance binary transfers.
-3. **Rarest-First Piece Selector**: Queries online peer bitfields and schedules downloads starting with the rarest piece across seeders to maximize chunk availability.
-4. **Bidirectional Startup Sync & Command Replay Logs**: Replicates database state on start via `SYNC_REQUEST` and maintains a transaction replay file (`tracker_pending_sync.txt`) for recovery when a peer is offline.
-5. **Transparent Failover**: Client detects primary tracker disconnects, automatically redirects commands to the backup tracker, and transparently recovers the user session in the background.
+3. **Rarest-First Piece Selector**: Queries online peer bitfields and schedules downloads starting with the rarest piece across available peers.
+4. **Sharing During Downloads**: Once a piece passes its SHA-1 check and is written to disk, the downloader registers with the tracker. Other clients can discover it, query its current bitfield, and request verified pieces before the full file completes. The partial file is added to the persistent local sharing database only after the whole-file check succeeds.
+5. **Bidirectional Startup Sync & Command Replay Logs**: Replicates database state on start via `SYNC_REQUEST` and maintains a transaction replay file (`tracker_pending_sync.txt`) for recovery when a peer is offline.
+6. **Transparent Failover**: Client detects primary tracker disconnects, automatically redirects commands to the backup tracker, and transparently recovers the user session in the background.
+
+Peer availability is sampled when each download starts. A running download does not yet refresh its peer list or bitfields, so it may need a retry to use pieces that another peer acquires later.

@@ -32,6 +32,8 @@ To maximize transfer efficiency and piece distribution in the network, we implem
 5. **Rarest Download Loop**: Each worker thread queries the queue for the rarest piece available on its assigned peer. It downloads the piece, verifies its SHA-1 hash against the tracker metadata, writes it to disk at the exact offset using concurrent file streams, and marks the piece as complete.
 6. **Error Handling**: If a chunk hash fails or a seeder connection drops, the piece is pushed back into the sorted queue for other workers to retrieve from alternate seeders.
 
+After a verified piece is written, the downloader exposes its local bitfield and registers with the tracker. This allows other clients to discover and request that piece before the downloader finishes. The file path is persisted as a complete local share only after the whole-file SHA-1 check succeeds. Peer lists and bitfields are currently sampled at download start; live availability refresh remains future work.
+
 ---
 
 ## 4. Network Protocol Design

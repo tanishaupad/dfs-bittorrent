@@ -15,6 +15,8 @@ struct DownloadProgress {
     size_t downloaded_pieces = 0;
     std::vector<bool> pieces_status; // true if downloaded
     bool is_completed = false;
+    bool announcing = false;
+    bool peer_announced = false;
     std::string status_str = "Downloading";
 };
 
@@ -46,6 +48,7 @@ public:
     std::string send_to_tracker(const std::string &cmd);
 
     void add_shared_file(const std::string &group_id, const std::string &file_name, const std::string &filepath);
+    void announce_verified_pieces(const std::string &group_id, const std::string &file_name, const std::string &filepath, const std::string &sharing_user);
     bool get_shared_file(const std::string &group_id, const std::string &file_name, std::string &filepath);
 
     void update_download_progress(const std::string &group_id, const std::string &file_name, size_t downloaded, size_t total, const std::vector<bool> &status, bool completed, const std::string &status_str);

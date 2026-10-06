@@ -122,6 +122,34 @@ void Client::add_shared_file(const std::string &group_id, const std::string &fil
     save_local_files_db();
 }
 
+void Client::announce_verified_pieces(const std::string &group_id, const std::string &file_name,
+                                     const std::string &filepath, const std::string &sharing_user) {
+    const std::string key = group_id + ":" + file_name;
+    {
+        std::lock_guard<std::mutex> lock(downloads_mtx);
+        auto it = downloads.find(key);
+        if (it == downloads.end() || it->second.downloaded_pieces == 0 ||
+            it->second.peer_announced || it->second.announcing) return;
+        it->second.announcing = true;
+    }
+
+    // The peer server must have a path before the tracker advertises this peer.
+    {
+        std::lock_guard<std::mutex> lock(files_mtx);
+        local_files[key] = filepath;
+    }
+    const std::string response = send_to_tracker("REGISTER_SEEDER " + group_id + " " +
+                                                 sharing_user + " " + file_name);
+    {
+        std::lock_guard<std::mutex> lock(downloads_mtx);
+        auto it = downloads.find(key);
+        if (it != downloads.end()) {
+            it->second.peer_announced = response.rfind("SUCCESS", 0) == 0;
+            it->second.announcing = false;
+        }
+    }
+}
+
 bool Client::get_shared_file(const std::string &group_id, const std::string &file_name, std::string &filepath) {
     std::lock_guard<std::mutex> lock(files_mtx);
     std::string key = group_id + ":" + file_name;
@@ -340,7 +368,7 @@ void peer_server(int server_fd, Client *cl) {
 }
 
 // Individual Peer Downloader Worker Thread
-void peer_download_worker(int sock, std::string peer_bitfield, std::string group_id, std::string file_name, std::string dest_path, const std::vector<std::string> &expected_hashes, PieceQueue *queue, Client *cl) {
+void peer_download_worker(int sock, std::string peer_bitfield, std::string group_id, std::string file_name, std::string dest_path, std::string sharing_user, const std::vector<std::string> &expected_hashes, PieceQueue *queue, Client *cl) {
     size_t piece_idx;
     static std::mutex file_write_mtx;
 
@@ -388,6 +416,11 @@ void peer_download_worker(int sock, std::string peer_bitfield, std::string group
             if (file.is_open()) {
                 file.seekp(piece_idx * 524288, std::ios::beg);
                 file.write(buffer.data(), data_len);
+                file.flush();
+                if (!file.good()) {
+                    queue->push_back(piece_idx);
+                    break;
+                }
                 file.close();
             } else {
                 queue->push_back(piece_idx);
@@ -405,12 +438,13 @@ void peer_download_worker(int sock, std::string peer_bitfield, std::string group
                 it->second.downloaded_pieces++;
             }
         }
+        cl->announce_verified_pieces(group_id, file_name, dest_path, sharing_user);
     }
     close(sock);
 }
 
 // Download Coordinator Thread
-void download_coordinator_thread(std::string group_id, std::string file_name, std::string dest_path, std::string file_sha1, std::vector<std::string> expected_hashes, std::vector<std::pair<std::string, int>> peer_addrs, Client *cl) {
+void download_coordinator_thread(std::string group_id, std::string file_name, std::string dest_path, std::string sharing_user, std::string file_sha1, std::vector<std::string> expected_hashes, std::vector<std::pair<std::string, int>> peer_addrs, Client *cl) {
     std::vector<int> peer_socks;
     std::vector<std::string> peer_bitfields;
 
@@ -476,7 +510,7 @@ void download_coordinator_thread(std::string group_id, std::string file_name, st
 
     std::vector<std::thread> workers;
     for (size_t i = 0; i < peer_socks.size(); i++) {
-        workers.push_back(std::thread(peer_download_worker, peer_socks[i], peer_bitfields[i], group_id, file_name, dest_path, expected_hashes, &queue, cl));
+        workers.push_back(std::thread(peer_download_worker, peer_socks[i], peer_bitfields[i], group_id, file_name, dest_path, sharing_user, expected_hashes, &queue, cl));
     }
 
     for (auto &t : workers) {
@@ -491,8 +525,7 @@ void download_coordinator_thread(std::string group_id, std::string file_name, st
         if (it != cl->downloads.end()) {
             if (it->second.downloaded_pieces == it->second.total_pieces) {
                 success = true;
-                it->second.is_completed = true;
-                it->second.status_str = "Completed";
+                it->second.status_str = "Verifying";
             } else {
                 it->second.status_str = "Failed";
             }
@@ -503,10 +536,13 @@ void download_coordinator_thread(std::string group_id, std::string file_name, st
         // Verify entire file hash
         std::string final_file_sha = SHA1::hash_file(dest_path);
         if (final_file_sha == file_sha1) {
+            cl->announce_verified_pieces(group_id, file_name, dest_path, sharing_user);
+            {
+                std::lock_guard<std::mutex> lock(cl->downloads_mtx);
+                cl->downloads[key].is_completed = true;
+                cl->downloads[key].status_str = "Completed";
+            }
             std::cout << "\n[C] [" << group_id << "] " << file_name << std::endl;
-            // Register as seeder with tracker
-            std::string reg_cmd = "REGISTER_SEEDER " + group_id + " " + cl->username + " " + file_name;
-            cl->send_to_tracker(reg_cmd);
             cl->add_shared_file(group_id, file_name, dest_path);
         } else {
             std::cout << "\nError: Integrity check failed for " << file_name << ". Redownload required." << std::endl;
@@ -741,7 +777,7 @@ void run_cli(Client *cl) {
             cl->update_download_progress(gid, fname, 0, pieces_count, p_status, false, "Downloading");
 
             // Start coordinator thread
-            std::thread th(download_coordinator_thread, gid, fname, dest_path, file_sha1, piece_hashes, peer_addrs, cl);
+            std::thread th(download_coordinator_thread, gid, fname, dest_path, cl->username, file_sha1, piece_hashes, peer_addrs, cl);
             th.detach();
 
             std::cout << "SUCCESS download started" << std::endl;
