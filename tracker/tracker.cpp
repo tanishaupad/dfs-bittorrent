@@ -246,33 +246,50 @@ bool TrackerState::create_group(const std::string &group_id, const std::string &
     g.group_id = group_id;
     g.owner_id = owner_id;
     g.members.insert(owner_id);
+    g.approved_ids[owner_id] = "owner:" + group_id + ":" + owner_id;
     groups[group_id] = g;
     return true;
 }
 
-bool TrackerState::join_group(const std::string &group_id, const std::string &username) {
+bool TrackerState::join_group(const std::string &group_id, const std::string &username,
+                              const std::string &request_id, bool is_sync) {
     std::lock_guard<std::mutex> lock(mtx);
     auto it = groups.find(group_id);
-    if (it == groups.end()) {
-        return false;
+    if (it == groups.end() || request_id.empty()) return false;
+    Group &group = it->second;
+    if (group.revoked_ids.count(request_id)) return is_sync;
+    if (group.approved_ids.count(username) && group.approved_ids.at(username) == request_id) {
+        group.members.insert(username);
+        group.pending_requests.erase(username);
+        group.request_ids.erase(username);
+        return true;
     }
-    if (it->second.members.find(username) != it->second.members.end()) {
-        return false; // Already a member
-    }
-    it->second.pending_requests.insert(username);
+    if (group.members.count(username) || group.pending_requests.count(username))
+        return is_sync; // Duplicate or concurrent request; keep the existing request.
+    group.request_ids[username] = request_id;
+    group.pending_requests.insert(username);
     return true;
 }
 
-bool TrackerState::leave_group(const std::string &group_id, const std::string &username) {
+bool TrackerState::leave_group(const std::string &group_id, const std::string &username,
+                               const std::string &request_id, bool is_sync) {
     std::lock_guard<std::mutex> lock(mtx);
     auto it = groups.find(group_id);
-    if (it == groups.end()) {
-        return false;
+    if (it == groups.end()) return false;
+    Group &group = it->second;
+    if (!is_sync && (!group.members.count(username) ||
+                     !group.approved_ids.count(username) ||
+                     group.approved_ids.at(username) != request_id)) return false;
+    if (request_id.empty()) return false;
+    group.revoked_ids.insert(request_id);
+    if (group.approved_ids.count(username) && group.approved_ids.at(username) == request_id) {
+        group.members.erase(username);
+        group.approved_ids.erase(username);
     }
-    if (it->second.members.find(username) == it->second.members.end()) {
-        return false;
+    if (group.request_ids.count(username) && group.request_ids.at(username) == request_id) {
+        group.pending_requests.erase(username);
+        group.request_ids.erase(username);
     }
-    it->second.members.erase(username);
     return true;
 }
 
@@ -304,19 +321,44 @@ std::vector<std::string> TrackerState::list_requests(const std::string &group_id
     return list;
 }
 
-bool TrackerState::accept_request(const std::string &group_id, const std::string &username, const std::string &owner_id) {
+bool TrackerState::accept_request(const std::string &group_id, const std::string &username,
+                                  const std::string &owner_id, const std::string &request_id,
+                                  bool is_sync) {
     std::lock_guard<std::mutex> lock(mtx);
     auto it = groups.find(group_id);
-    if (it == groups.end() || it->second.owner_id != owner_id) {
-        return false;
+    if (it == groups.end() || it->second.owner_id != owner_id || request_id.empty()) return false;
+    Group &group = it->second;
+    if (group.revoked_ids.count(request_id)) return is_sync;
+    if (!is_sync && (!group.pending_requests.count(username) ||
+                     !group.request_ids.count(username) ||
+                     group.request_ids.at(username) != request_id)) return false;
+    // An approval can arrive before its request. Retain its ID until the request
+    // arrives; a matching removal tombstone still takes precedence.
+    group.approved_ids[username] = request_id;
+    if (group.request_ids.count(username) && group.request_ids.at(username) == request_id) {
+        group.pending_requests.erase(username);
+        group.request_ids.erase(username);
     }
-    auto req_it = it->second.pending_requests.find(username);
-    if (req_it == it->second.pending_requests.end()) {
-        return false;
-    }
-    it->second.pending_requests.erase(req_it);
-    it->second.members.insert(username);
+    group.members.insert(username);
     return true;
+}
+
+std::string TrackerState::pending_request_id(const std::string &group_id,
+                                              const std::string &username) {
+    std::lock_guard<std::mutex> lock(mtx);
+    auto group = groups.find(group_id);
+    if (group == groups.end()) return "";
+    auto request = group->second.request_ids.find(username);
+    return request == group->second.request_ids.end() ? "" : request->second;
+}
+
+std::string TrackerState::approved_request_id(const std::string &group_id,
+                                               const std::string &username) {
+    std::lock_guard<std::mutex> lock(mtx);
+    auto group = groups.find(group_id);
+    if (group == groups.end()) return "";
+    auto approval = group->second.approved_ids.find(username);
+    return approval == group->second.approved_ids.end() ? "" : approval->second;
 }
 
 bool TrackerState::upload_file(const std::string &group_id, const std::string &username, const std::string &file_name, size_t file_size, const std::string &file_sha1, const std::vector<std::string> &piece_sha1s) {
@@ -439,6 +481,12 @@ void TrackerState::serialize(std::ostream &os) {
         for (const auto &r : pair.second.pending_requests) {
             os << "PENDING " << pair.second.group_id << " " << r << "\n";
         }
+        for (const auto &entry : pair.second.request_ids)
+            os << "REQUEST_ID " << pair.second.group_id << " " << entry.first << " " << entry.second << "\n";
+        for (const auto &entry : pair.second.approved_ids)
+            os << "APPROVED_ID " << pair.second.group_id << " " << entry.first << " " << entry.second << "\n";
+        for (const auto &id : pair.second.revoked_ids)
+            os << "REVOKED_ID " << pair.second.group_id << " " << id << "\n";
     }
     for (const auto &pair : files) {
         os << "FILE " << pair.second.group_id << " " << pair.second.file_name << " "
@@ -497,6 +545,12 @@ void TrackerState::deserialize(const std::string &data) {
                 std::string username = tokens[2];
                 groups[g_id].pending_requests.insert(username);
             }
+        } else if (type == "REQUEST_ID" && tokens.size() >= 4) {
+            groups[tokens[1]].request_ids[tokens[2]] = tokens[3];
+        } else if (type == "APPROVED_ID" && tokens.size() >= 4) {
+            groups[tokens[1]].approved_ids[tokens[2]] = tokens[3];
+        } else if (type == "REVOKED_ID" && tokens.size() >= 3) {
+            groups[tokens[1]].revoked_ids.insert(tokens[2]);
         } else if (type == "FILE") {
             if (tokens.size() >= 5) {
                 SharedFile f;
@@ -519,6 +573,17 @@ void TrackerState::deserialize(const std::string &data) {
                 files[key].seeders.insert(username);
             }
         }
+    }
+    // Old snapshots recorded membership but not request IDs.
+    for (auto &entry : groups) {
+        Group &group = entry.second;
+        for (const auto &user : group.members)
+            if (!group.approved_ids.count(user))
+                group.approved_ids[user] = (user == group.owner_id ? "owner:" : "legacy:") +
+                                           group.group_id + ":" + user;
+        for (const auto &user : group.pending_requests)
+            if (!group.request_ids.count(user))
+                group.request_ids[user] = "legacy:" + group.group_id + ":" + user;
     }
 }
 
@@ -615,9 +680,11 @@ std::string handle_command(const std::string &cmd_raw, bool is_sync, std::string
         if (tokens.size() < 3) return "ERROR invalid args";
         std::string group_id = tokens[1];
         std::string username = tokens[2];
-        if (state.join_group(group_id, username)) {
+        std::string request_id = tokens.size() >= 4 ? tokens[3] :
+            (is_sync ? "legacy:" + group_id + ":" + username : new_session_token());
+        if (state.join_group(group_id, username, request_id, is_sync)) {
             state.save_to_file(state_file);
-            if (!is_sync) queue_sync(cmd_str);
+            if (!is_sync) queue_sync("JOIN_GROUP " + group_id + " " + username + " " + request_id);
             return "SUCCESS";
         }
         return "ERROR group not found or already a member/pending";
@@ -626,9 +693,11 @@ std::string handle_command(const std::string &cmd_raw, bool is_sync, std::string
         if (tokens.size() < 3) return "ERROR invalid args";
         std::string group_id = tokens[1];
         std::string username = tokens[2];
-        if (state.leave_group(group_id, username)) {
+        std::string request_id = tokens.size() >= 4 ? tokens[3] :
+            state.approved_request_id(group_id, username);
+        if (state.leave_group(group_id, username, request_id, is_sync)) {
             state.save_to_file(state_file);
-            if (!is_sync) queue_sync(cmd_str);
+            if (!is_sync) queue_sync("LEAVE_GROUP " + group_id + " " + username + " " + request_id);
             return "SUCCESS";
         }
         return "ERROR group not found or user not a member";
@@ -663,9 +732,11 @@ std::string handle_command(const std::string &cmd_raw, bool is_sync, std::string
         std::string group_id = tokens[1];
         std::string username = tokens[2];
         std::string owner_id = tokens[3];
-        if (state.accept_request(group_id, username, owner_id)) {
+        std::string request_id = tokens.size() >= 5 ? tokens[4] :
+            state.pending_request_id(group_id, username);
+        if (state.accept_request(group_id, username, owner_id, request_id, is_sync)) {
             state.save_to_file(state_file);
-            if (!is_sync) queue_sync(cmd_str);
+            if (!is_sync) queue_sync("ACCEPT_REQUEST " + group_id + " " + username + " " + owner_id + " " + request_id);
             return "SUCCESS";
         }
         return "ERROR accept request failed";

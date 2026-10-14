@@ -5,6 +5,7 @@
 #include <vector>
 #include <unordered_map>
 #include <set>
+#include <map>
 #include <mutex>
 #include <iostream>
 
@@ -22,6 +23,11 @@ struct Group {
     std::string owner_id;
     std::set<std::string> members;
     std::set<std::string> pending_requests;
+    // IDs survive synchronization and restart, so an approval cannot attach to
+    // a later request from the same user.
+    std::map<std::string, std::string> request_ids;
+    std::map<std::string, std::string> approved_ids;
+    std::set<std::string> revoked_ids;
 };
 
 struct SharedFile {
@@ -49,11 +55,17 @@ public:
                             const std::string &requester, const std::string &request_token,
                             const std::string &seeder);
     bool create_group(const std::string &group_id, const std::string &owner_id);
-    bool join_group(const std::string &group_id, const std::string &username);
-    bool leave_group(const std::string &group_id, const std::string &username);
+    bool join_group(const std::string &group_id, const std::string &username,
+                    const std::string &request_id, bool is_sync);
+    bool leave_group(const std::string &group_id, const std::string &username,
+                     const std::string &request_id, bool is_sync);
     std::vector<std::string> list_groups();
     std::vector<std::string> list_requests(const std::string &group_id, const std::string &owner_id, bool &is_owner);
-    bool accept_request(const std::string &group_id, const std::string &username, const std::string &owner_id);
+    bool accept_request(const std::string &group_id, const std::string &username,
+                        const std::string &owner_id, const std::string &request_id,
+                        bool is_sync);
+    std::string pending_request_id(const std::string &group_id, const std::string &username);
+    std::string approved_request_id(const std::string &group_id, const std::string &username);
     bool upload_file(const std::string &group_id, const std::string &username, const std::string &file_name, size_t file_size, const std::string &file_sha1, const std::vector<std::string> &piece_sha1s);
     bool register_peer(const std::string &group_id, const std::string &username, const std::string &file_name);
     std::vector<std::string> list_files(const std::string &group_id, const std::string &username, bool &is_member);
