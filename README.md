@@ -103,6 +103,7 @@ Once a client starts, it presents an interactive prompt `>` accepting the follow
 | `list files <group id>` | Displays all files available in a group. |
 | `download file <group id> <file name> <dest path>` | Downloads a shared file in parallel from group seeders. |
 | `show downloads` | Displays the progress of current/completed downloads. |
+| `show stats` | Displays the client’s uploaded payload byte count. |
 | `stop share <group id> <file name>` | Stops seeding a file in the group. |
 | `logout` | Ends the current session and stops active seeding. |
 | `quit` | Gracefully closes the client application. |
@@ -125,6 +126,8 @@ Peer availability is sampled when each download starts. A running download does 
 ## Local validation
 
 After building both programs, run `python3 test_partial_discovery.py`, `python3 test_recovery.py`, `python3 test_tracker_recovery.py`, `python3 test_membership_conflict.py`, and `python3 test_namespace_conflict.py`. These tests use temporary tracker state and controlled peers. They cover piece sharing during downloads, recovery from corrupt and disconnected peers, concurrent files, tracker convergence after independent writes and restart, concurrent group approval/removal in both delivery orders, and filename/namespace conflicts.
+
+Run `python3 test_large_file.py` for a 1 GiB end-to-end transfer over loopback TCP. The test starts two trackers and two clients, creates a binary source file in a temporary directory, transfers it in 512 KiB pieces, compares full-file SHA-1 hashes, checks that the source sent at least 1,073,741,824 payload bytes, and samples both clients' resident memory. The temporary files are removed afterward. Set `DFS_LARGE_TEST_MIB=16` for a quick harness smoke test. On the local validation run, the 1 GiB transfer completed and verified; sampled peak RSS was 8.3 MiB for each client. These measurements are from one host and do not establish performance on a real network or under interruptions during a 1 GiB transfer.
 
 Run `python3 benchmark_distribution.py` to repeat the local distribution comparison. It starts two trackers and three clients in temporary directories, verifies both downloaded hashes, and writes measurements to `benchmarks/results.json`. The centralized mode disables sharing on the first downloader. The cooperative mode starts the second downloader after the first advertises a verified piece. The seeded mode starts it after the first finishes. All modes use the same C++ transfer code and a 25 ms process-wide delay per uploaded piece to model a limited uplink. The `show stats` client command prints uploaded payload bytes. `DFS_UPLOAD_DELAY_MS` and `DFS_DISABLE_SHARING=1` are benchmark controls; leave them unset for normal use.
 
