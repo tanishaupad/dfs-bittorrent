@@ -15,155 +15,116 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <csignal>
+#include <atomic>
+#include <cstdint>
+#include <cstdio>
 
-// Global structures
+// Global state and a durable anti-entropy journal. All command application is
+// serialized by operation_mtx so snapshots and journal entries have one order.
 TrackerState state;
-std::vector<std::string> pending_syncs;
-std::mutex sync_mtx;
-std::condition_variable sync_cv;
-bool running = true;
-std::string sync_log_file;
+std::mutex operation_mtx;
+std::mutex journal_mtx;
+std::vector<std::pair<std::string, std::string>> journal;
+std::set<std::string> seen_operations;
+std::atomic<bool> running{true};
+std::string journal_file;
 std::string state_file;
+int local_tracker_no = 0;
+uint64_t next_operation = 0;
 
-// Sync functions
+std::string handle_command(const std::string &, bool, std::string &);
+
+bool append_journal(const std::string &id, const std::string &cmd) {
+    std::ofstream file(journal_file, std::ios::app);
+    if (!file.is_open()) return false;
+    file << id << "\t" << cmd << "\n";
+    file.flush();
+    return file.good();
+}
+
 void queue_sync(const std::string &cmd) {
-    std::lock_guard<std::mutex> lock(sync_mtx);
-    pending_syncs.push_back(cmd);
-
-    // Append to sync log file
-    std::ofstream file(sync_log_file, std::ios::app);
-    if (file.is_open()) {
-        file << cmd << "\n";
+    std::lock_guard<std::mutex> lock(journal_mtx);
+    std::string id = std::to_string(local_tracker_no) + ":" +
+                     std::to_string(++next_operation);
+    if (!append_journal(id, cmd)) {
+        std::cerr << "Failed to append tracker operation journal" << std::endl;
+        return;
     }
-    sync_cv.notify_one();
+    seen_operations.insert(id);
+    journal.push_back({id, cmd});
+}
+
+void load_journal() {
+    std::ifstream file(journal_file);
+    std::string line;
+    while (std::getline(file, line)) {
+        size_t tab = line.find('\t');
+        if (tab == std::string::npos) continue;
+        std::string id = line.substr(0, tab);
+        std::string cmd = line.substr(tab + 1);
+        if (seen_operations.insert(id).second) journal.push_back({id, cmd});
+        std::string prefix = std::to_string(local_tracker_no) + ":";
+        if (id.rfind(prefix, 0) == 0) {
+            try { next_operation = std::max(next_operation, std::stoull(id.substr(prefix.size()))); }
+            catch (const std::exception &) { /* Ignore malformed journal ids. */ }
+        }
+    }
+}
+
+bool apply_remote_operation(const std::string &id, const std::string &cmd) {
+    std::lock_guard<std::mutex> operation_lock(operation_mtx);
+    {
+        std::lock_guard<std::mutex> journal_lock(journal_mtx);
+        if (seen_operations.count(id)) return true;
+    }
+    std::string ignored;
+    std::string response = handle_command(cmd, true, ignored);
+    if (response.rfind("SUCCESS", 0) != 0) return false;
+    std::lock_guard<std::mutex> journal_lock(journal_mtx);
+    if (!append_journal(id, cmd)) return false;
+    seen_operations.insert(id);
+    journal.push_back({id, cmd});
+    return true;
 }
 
 void sync_worker(std::string other_ip, int other_port) {
     while (running) {
-        std::vector<std::string> current_syncs;
-        {
-            std::unique_lock<std::mutex> lock(sync_mtx);
-            sync_cv.wait_for(lock, std::chrono::seconds(2), []() {
-                return !pending_syncs.empty() || !running;
-            });
-            if (!running) break;
-            current_syncs = pending_syncs;
-        }
-
-        if (current_syncs.empty()) continue;
-
         int sock = socket(AF_INET, SOCK_STREAM, 0);
-        if (sock < 0) {
-            std::this_thread::sleep_for(std::chrono::seconds(2));
-            continue;
-        }
-
-        struct timeval tv;
-        tv.tv_sec = 2;
-        tv.tv_usec = 0;
-        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
-        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
-
-        sockaddr_in serv_addr;
-        serv_addr.sin_family = AF_INET;
-        serv_addr.sin_port = htons(other_port);
-        if (inet_pton(AF_INET, other_ip.c_str(), &serv_addr.sin_addr) <= 0) {
-            close(sock);
-            std::this_thread::sleep_for(std::chrono::seconds(2));
-            continue;
-        }
-
-        if (connect(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
-            close(sock);
-            std::this_thread::sleep_for(std::chrono::seconds(5));
-            continue; // Peer offline
-        }
-
-        bool success = true;
-        size_t sent_count = 0;
-        for (const auto &cmd : current_syncs) {
-            std::string sync_msg = "SYNC_CMD " + cmd;
-            if (!Utils::send_msg(sock, sync_msg)) {
-                success = false;
-                break;
-            }
-            std::string ack = Utils::recv_msg(sock);
-            if (ack != "SYNC_ACK") {
-                success = false;
-                break;
-            }
-            sent_count++;
-        }
-
-        close(sock);
-
-        if (sent_count > 0) {
-            std::lock_guard<std::mutex> lock(sync_mtx);
-            pending_syncs.erase(pending_syncs.begin(), pending_syncs.begin() + sent_count);
-            // Rewrite log file
-            std::ofstream file(sync_log_file, std::ios::trunc);
-            if (file.is_open()) {
-                for (const auto &cmd : pending_syncs) {
-                    file << cmd << "\n";
+        if (sock >= 0) {
+            struct timeval tv{2, 0};
+            setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+            sockaddr_in address{};
+            address.sin_family = AF_INET;
+            address.sin_port = htons(other_port);
+            if (inet_pton(AF_INET, other_ip.c_str(), &address.sin_addr) == 1 &&
+                connect(sock, reinterpret_cast<sockaddr *>(&address), sizeof(address)) == 0 &&
+                Utils::send_msg(sock, "SYNC_PULL")) {
+                while (running) {
+                    std::string response = Utils::recv_msg(sock);
+                    if (response == "SYNC_END" || response.empty()) break;
+                    if (response.rfind("SYNC_OP ", 0) != 0) break;
+                    size_t separator = response.find(' ', 8);
+                    if (separator == std::string::npos) break;
+                    apply_remote_operation(response.substr(8, separator - 8),
+                                           response.substr(separator + 1));
+                }
+                std::vector<std::pair<std::string, std::string>> snapshot;
+                {
+                    std::lock_guard<std::mutex> lock(journal_mtx);
+                    snapshot = journal;
+                }
+                for (const auto &entry : snapshot) {
+                    if (!Utils::send_msg(sock, "SYNC_OP " + entry.first + " " + entry.second)) break;
+                    std::string reply = Utils::recv_msg(sock);
+                    if (reply != "SYNC_ACK " + entry.first) break;
                 }
             }
+            close(sock);
         }
-
-        if (!success) {
-            std::this_thread::sleep_for(std::chrono::seconds(2));
-        }
+        for (int i = 0; i < 20 && running; ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
-}
-
-bool sync_on_startup(const std::string &other_ip, int other_port, TrackerState &st) {
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) return false;
-
-    struct timeval tv;
-    tv.tv_sec = 4;
-    tv.tv_usec = 0;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
-    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
-
-    sockaddr_in serv_addr;
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(other_port);
-    if (inet_pton(AF_INET, other_ip.c_str(), &serv_addr.sin_addr) <= 0) {
-        close(sock);
-        return false;
-    }
-
-    if (connect(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
-        close(sock);
-        return false;
-    }
-
-    if (!Utils::send_msg(sock, "SYNC_REQUEST")) {
-        close(sock);
-        return false;
-    }
-
-    bool received_complete = false;
-    std::string response = "";
-    while (true) {
-        std::string line = Utils::recv_msg(sock);
-        if (line.empty()) {
-            break;
-        }
-        if (line == "SYNC_COMPLETE") {
-            received_complete = true;
-            break;
-        }
-        response += line + "\n";
-    }
-
-    close(sock);
-
-    if (received_complete) {
-        st.deserialize(response);
-        return true;
-    }
-    return false;
 }
 
 // State Operations implementations
@@ -405,7 +366,9 @@ void TrackerState::serialize(std::ostream &os) {
     std::lock_guard<std::mutex> lock(mtx);
     for (const auto &pair : users) {
         os << "USER " << pair.second.username << " " << pair.second.password_hash << " "
-           << (pair.second.is_logged_in ? "1" : "0") << " " << pair.second.client_ip << " " << pair.second.client_port << "\n";
+           << (pair.second.is_logged_in ? "1" : "0") << " "
+           << (pair.second.client_ip.empty() ? "-" : pair.second.client_ip)
+           << " " << pair.second.client_port << "\n";
     }
     for (const auto &pair : groups) {
         os << "GROUP " << pair.second.group_id << " " << pair.second.owner_id << "\n";
@@ -449,7 +412,7 @@ void TrackerState::deserialize(const std::string &data) {
                 u.username = tokens[1];
                 u.password_hash = tokens[2];
                 u.is_logged_in = (tokens[3] == "1");
-                u.client_ip = tokens[4];
+                u.client_ip = tokens[4] == "-" ? "" : tokens[4];
                 u.client_port = std::stoi(tokens[5]);
                 users[u.username] = u;
             }
@@ -498,10 +461,15 @@ void TrackerState::deserialize(const std::string &data) {
 }
 
 void TrackerState::save_to_file(const std::string &filepath) {
-    std::ofstream file(filepath);
-    if (file.is_open()) {
-        serialize(file);
-    }
+    const std::string temporary = filepath + ".tmp";
+    std::ofstream file(temporary, std::ios::trunc);
+    if (!file.is_open()) return;
+    serialize(file);
+    file.flush();
+    if (!file.good()) return;
+    file.close();
+    if (std::rename(temporary.c_str(), filepath.c_str()) != 0)
+        std::cerr << "Failed to replace tracker state file" << std::endl;
 }
 
 void TrackerState::load_from_file(const std::string &filepath) {
@@ -734,22 +702,31 @@ void client_handler(int client_fd) {
         }
 
         request = Utils::trim(request);
-        if (request.rfind("SYNC_CMD ", 0) == 0) {
-            // Processing sync update from other tracker
-            std::string cmd = request.substr(9);
-            std::string ignored;
-            handle_command(cmd, true, ignored);
-            Utils::send_msg(client_fd, "SYNC_ACK");
+        if (request.rfind("SYNC_OP ", 0) == 0) {
+            size_t separator = request.find(' ', 8);
+            if (separator == std::string::npos) {
+                Utils::send_msg(client_fd, "SYNC_NACK");
+                continue;
+            }
+            std::string id = request.substr(8, separator - 8);
+            std::string cmd = request.substr(separator + 1);
+            bool applied = apply_remote_operation(id, cmd);
+            Utils::send_msg(client_fd, (applied ? "SYNC_ACK " : "SYNC_NACK ") + id);
         }
-        else if (request == "SYNC_REQUEST") {
-            // Dump state
-            std::stringstream ss;
-            state.serialize(ss);
-            Utils::send_msg(client_fd, ss.str());
-            Utils::send_msg(client_fd, "SYNC_COMPLETE");
+        else if (request == "SYNC_PULL") {
+            std::vector<std::pair<std::string, std::string>> snapshot;
+            {
+                std::lock_guard<std::mutex> lock(journal_mtx);
+                snapshot = journal;
+            }
+            for (const auto &entry : snapshot) {
+                if (!Utils::send_msg(client_fd, "SYNC_OP " + entry.first + " " + entry.second))
+                    break;
+            }
+            Utils::send_msg(client_fd, "SYNC_END");
         }
         else {
-            // Regular client request
+            std::lock_guard<std::mutex> lock(operation_mtx);
             std::string response = handle_command(request, false, associated_username);
             Utils::send_msg(client_fd, response);
         }
@@ -764,8 +741,6 @@ void console_handler() {
         if (cmd == "quit") {
             running = false;
             std::cout << "Shutting down tracker server..." << std::endl;
-            // Wake up CV just in case
-            sync_cv.notify_all();
             break;
         }
     }
@@ -800,29 +775,17 @@ int main(int argc, char *argv[]) {
     int other_port = trackers[2 - tracker_no].second;
 
     state_file = "tracker" + std::to_string(tracker_no) + "_state.txt";
-    sync_log_file = "tracker" + std::to_string(tracker_no) + "_pending_sync.txt";
+    journal_file = "tracker" + std::to_string(tracker_no) + "_journal.txt";
+    local_tracker_no = tracker_no;
 
-    // Try to restore state from local persistence file first
+    // Restore the last complete snapshot. The journal can reconstruct it if missing.
+    const bool have_snapshot = std::ifstream(state_file).good();
     state.load_from_file(state_file);
-
-    // Attempt startup synchronization with the other tracker
-    std::cout << "Attempting synchronization with the other tracker at " << other_ip << ":" << other_port << "..." << std::endl;
-    if (sync_on_startup(other_ip, other_port, state)) {
-        std::cout << "Synchronization successful! Database state updated." << std::endl;
-        // Clear any locally pending sync files since we're now updated to the peer's fresh state
-        std::ofstream clear_file(sync_log_file, std::ios::trunc);
-    } else {
-        std::cout << "Could not connect to peer tracker or sync failed. Running with local persisted state." << std::endl;
-        // Load pending syncs if any from file
-        std::ifstream sync_file(sync_log_file);
-        if (sync_file.is_open()) {
-            std::string line;
-            while (std::getline(sync_file, line)) {
-                line = Utils::trim(line);
-                if (!line.empty()) {
-                    pending_syncs.push_back(line);
-                }
-            }
+    load_journal();
+    if (!have_snapshot) {
+        for (const auto &entry : journal) {
+            std::string ignored;
+            handle_command(entry.second, true, ignored);
         }
     }
 
@@ -834,7 +797,6 @@ int main(int argc, char *argv[]) {
     if (server_fd < 0) {
         std::cerr << "Socket creation failed." << std::endl;
         running = false;
-        sync_cv.notify_all();
         sync_th.join();
         return 1;
     }
@@ -851,7 +813,6 @@ int main(int argc, char *argv[]) {
         std::cerr << "Bind failed on port " << my_port << std::endl;
         close(server_fd);
         running = false;
-        sync_cv.notify_all();
         sync_th.join();
         return 1;
     }
@@ -860,7 +821,6 @@ int main(int argc, char *argv[]) {
         std::cerr << "Listen failed." << std::endl;
         close(server_fd);
         running = false;
-        sync_cv.notify_all();
         sync_th.join();
         return 1;
     }

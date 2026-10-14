@@ -14,11 +14,10 @@ The project is built entirely in C++17 using standard networking and system APIs
 ---
 
 ## 2. Tracker Synchronization Algorithm Design
-A robust bidirectional synchronization protocol guarantees eventual consistency between Tracker 1 and Tracker 2:
 
-- **Startup Sync**: When Tracker $T_i$ boots, it attempts a TCP connection to Tracker $T_{1-i}$. If successful, it triggers a `SYNC_REQUEST`. $T_{1-i}$ serializes its entire database into raw text and streams it over the socket. $T_i$ reads this payload, deserializes it, updates its memory, and truncates its local pending queue. If $T_{1-i}$ is offline, $T_i$ falls back to its local state file.
-- **Incremental Sync**: When a tracker executes a state-altering command (e.g., user creation, group registration, file upload), it queues a command string (e.g., `CREATE_USER user1 pwd_hash`) in a thread-safe sync list. A background worker thread attempts to send these commands to the other tracker.
-- **Offline Transaction Logs**: If the peer tracker goes offline during incremental sync, the worker logs commands to `tracker<no>_pending_sync.txt` and sleeps. Once the peer starts up, it recovers using Startup Sync, allowing the primary tracker to safely discard its pending queue.
+Each tracker persists accepted changes in `tracker<no>_journal.txt` with a unique `<tracker>:<sequence>` identifier. A background worker requests the other tracker's journal using `SYNC_PULL`, applies unseen entries, and sends its own entries using `SYNC_OP`. The receiver answers `SYNC_ACK <id>` only when an entry is already known or has been applied and appended locally; failed applications receive `SYNC_NACK <id>`. This avoids treating failed replay as success and avoids overwriting local state on startup.
+
+Trackers also save atomic state snapshots. On restart, they load their snapshot and journal, or replay the journal if the snapshot is absent. When both trackers accept independent changes during a separation, they continue serving their local view and exchange the missing operations after reconnection. Their answers may differ during the separation. Concurrent conflicting edits to the same identifier are not resolved deterministically by this design and remain a limitation.
 
 ---
 
