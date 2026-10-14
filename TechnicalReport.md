@@ -30,7 +30,7 @@ To maximize transfer efficiency and piece distribution in the network, we implem
 3. **Frequency Mapping**: The coordinator thread computes the frequency of each piece index (i.e. how many seeders possess that chunk) and initializes a `PieceQueue` sorted in ascending order of frequency.
 4. **Worker Allocation**: A pool of downloader threads is allocated (one thread per connected seeder). Since sockets are stream-oriented, dedicating one thread to a single peer connection eliminates socket read/write concurrency issues and locks.
 5. **Rarest Download Loop**: Each worker thread queries the queue for the rarest piece available on its assigned peer. It downloads the piece, verifies its SHA-1 hash against the tracker metadata, writes it to disk at the exact offset using concurrent file streams, and marks the piece as complete.
-6. **Error Handling**: If a chunk hash fails or a seeder connection drops, the piece is pushed back into the sorted queue for other workers to retrieve from alternate seeders.
+6. **Error Handling**: If a chunk hash fails, the scheduler excludes that peer for the piece and returns the piece to the queue. If the peer disconnects, its in-flight piece returns to the queue. Idle workers wait for in-flight work to finish before deciding there is no more work they can serve.
 
 After a verified piece is written, the downloader exposes its local bitfield and registers with the tracker. This allows other clients to discover and request that piece before the downloader finishes. The file path is persisted as a complete local share only after the whole-file SHA-1 check succeeds. Peer lists and bitfields are currently sampled at download start; live availability refresh remains future work.
 

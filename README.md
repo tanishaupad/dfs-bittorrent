@@ -118,3 +118,7 @@ Once a client starts, it presents an interactive prompt `>` accepting the follow
 6. **Transparent Failover**: Client detects primary tracker disconnects, automatically redirects commands to the backup tracker, and transparently recovers the user session in the background.
 
 Peer availability is sampled when each download starts. A running download does not yet refresh its peer list or bitfields, so it may need a retry to use pieces that another peer acquires later.
+
+## Local validation
+
+After building both programs, run `python3 test_partial_discovery.py` and `python3 test_recovery.py`. The latter uses temporary tracker state and controlled peers to check that corrupt pieces are fetched from another peer, a dropped peer does not strand a piece, and two files can download at the same time.

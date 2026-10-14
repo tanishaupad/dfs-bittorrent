@@ -22,9 +22,12 @@ Client client_inst;
 // PieceQueue struct definition for Rarest-first scheduling
 struct PieceQueue {
     std::mutex mtx;
+    std::condition_variable cv;
     std::vector<size_t> pending_pieces; // piece indices sorted by rarest first
     std::vector<bool> in_progress;
+    std::vector<std::vector<bool>> rejected_by_peer;
     std::vector<size_t> frequencies;
+    size_t active_pieces = 0;
 
     void initialize(size_t num_pieces, const std::vector<std::string> &peer_bitfields) {
         frequencies.assign(num_pieces, 0);
@@ -36,11 +39,7 @@ struct PieceQueue {
             }
         }
 
-        for (size_t i = 0; i < num_pieces; i++) {
-            if (frequencies[i] > 0) {
-                pending_pieces.push_back(i);
-            }
-        }
+        for (size_t i = 0; i < num_pieces; i++) pending_pieces.push_back(i);
 
         // Sort rarest-first
         std::sort(pending_pieces.begin(), pending_pieces.end(), [this](size_t a, size_t b) {
@@ -48,34 +47,45 @@ struct PieceQueue {
         });
 
         in_progress.assign(num_pieces, false);
+        rejected_by_peer.assign(peer_bitfields.size(), std::vector<bool>(num_pieces, false));
     }
 
-    bool pop_piece(const std::string &peer_bitfield, size_t &piece_idx) {
-        std::lock_guard<std::mutex> lock(mtx);
-        for (auto it = pending_pieces.begin(); it != pending_pieces.end(); ++it) {
-            size_t p = *it;
-            if (p < peer_bitfield.size() && peer_bitfield[p] == '1' && !in_progress[p]) {
-                piece_idx = p;
-                in_progress[p] = true;
-                pending_pieces.erase(it);
-                return true;
+    bool pop_piece(size_t peer_index, const std::string &peer_bitfield, size_t &piece_idx) {
+        std::unique_lock<std::mutex> lock(mtx);
+        while (true) {
+            for (auto it = pending_pieces.begin(); it != pending_pieces.end(); ++it) {
+                size_t p = *it;
+                if (p < peer_bitfield.size() && peer_bitfield[p] == '1' &&
+                    !rejected_by_peer[peer_index][p]) {
+                    piece_idx = p;
+                    in_progress[p] = true;
+                    ++active_pieces;
+                    pending_pieces.erase(it);
+                    return true;
+                }
             }
+            if (active_pieces == 0) return false;
+            cv.wait(lock);
         }
-        return false;
     }
 
-    void push_back(size_t piece_idx) {
+    void retry(size_t peer_index, size_t piece_idx, bool reject_peer) {
         std::lock_guard<std::mutex> lock(mtx);
+        if (reject_peer) rejected_by_peer[peer_index][piece_idx] = true;
         in_progress[piece_idx] = false;
+        --active_pieces;
         auto it = std::lower_bound(pending_pieces.begin(), pending_pieces.end(), piece_idx, [this](size_t a, size_t b) {
             return frequencies[a] < frequencies[b];
         });
         pending_pieces.insert(it, piece_idx);
+        cv.notify_all();
     }
 
-    bool is_empty() {
+    void complete(size_t piece_idx) {
         std::lock_guard<std::mutex> lock(mtx);
-        return pending_pieces.empty();
+        in_progress[piece_idx] = false;
+        --active_pieces;
+        cv.notify_all();
     }
 };
 
@@ -368,34 +378,45 @@ void peer_server(int server_fd, Client *cl) {
 }
 
 // Individual Peer Downloader Worker Thread
-void peer_download_worker(int sock, std::string peer_bitfield, std::string group_id, std::string file_name, std::string dest_path, std::string sharing_user, const std::vector<std::string> &expected_hashes, PieceQueue *queue, Client *cl) {
+void peer_download_worker(size_t peer_index, int sock, std::string peer_bitfield, std::string group_id, std::string file_name, std::string dest_path, std::string sharing_user, size_t file_size, const std::vector<std::string> &expected_hashes, PieceQueue *queue, Client *cl) {
     size_t piece_idx;
     static std::mutex file_write_mtx;
 
-    while (queue->pop_piece(peer_bitfield, piece_idx)) {
+    while (queue->pop_piece(peer_index, peer_bitfield, piece_idx)) {
         std::string req = "GET_PIECE " + group_id + " " + file_name + " " + std::to_string(piece_idx);
         if (!Utils::send_msg(sock, req)) {
-            queue->push_back(piece_idx);
+            queue->retry(peer_index, piece_idx, false);
             break;
         }
 
         std::string response = Utils::recv_msg(sock);
         if (response.empty()) {
-            queue->push_back(piece_idx);
+            queue->retry(peer_index, piece_idx, false);
             break;
         }
 
         std::vector<std::string> tokens = Utils::split(response, ' ');
         if (tokens.size() < 2 || tokens[0] != "OK") {
-            queue->push_back(piece_idx);
+            queue->retry(peer_index, piece_idx, true);
             continue;
         }
 
-        size_t data_len = std::stoull(tokens[1]);
+        size_t data_len = 0;
+        try { data_len = std::stoull(tokens[1]); }
+        catch (const std::exception &) {
+            queue->retry(peer_index, piece_idx, false);
+            break;
+        }
+        const size_t offset = piece_idx * 524288;
+        const size_t expected_len = std::min<size_t>(524288, file_size - offset);
+        if (data_len != expected_len) {
+            queue->retry(peer_index, piece_idx, false);
+            break;
+        }
         std::vector<char> buffer(data_len);
         ssize_t bytes_read = Utils::read_all(sock, buffer.data(), data_len);
         if (bytes_read != static_cast<ssize_t>(data_len)) {
-            queue->push_back(piece_idx);
+            queue->retry(peer_index, piece_idx, false);
             break;
         }
 
@@ -405,7 +426,7 @@ void peer_download_worker(int sock, std::string peer_bitfield, std::string group
         std::string calculated_hash = piece_sha.final();
 
         if (calculated_hash != expected_hashes[piece_idx]) {
-            queue->push_back(piece_idx);
+            queue->retry(peer_index, piece_idx, true);
             continue; // Hash failed, retry
         }
 
@@ -418,13 +439,13 @@ void peer_download_worker(int sock, std::string peer_bitfield, std::string group
                 file.write(buffer.data(), data_len);
                 file.flush();
                 if (!file.good()) {
-                    queue->push_back(piece_idx);
+                    queue->retry(peer_index, piece_idx, false);
                     break;
                 }
                 file.close();
             } else {
-                queue->push_back(piece_idx);
-                continue;
+                queue->retry(peer_index, piece_idx, false);
+                break;
             }
         }
 
@@ -438,13 +459,14 @@ void peer_download_worker(int sock, std::string peer_bitfield, std::string group
                 it->second.downloaded_pieces++;
             }
         }
+        queue->complete(piece_idx);
         cl->announce_verified_pieces(group_id, file_name, dest_path, sharing_user);
     }
     close(sock);
 }
 
 // Download Coordinator Thread
-void download_coordinator_thread(std::string group_id, std::string file_name, std::string dest_path, std::string sharing_user, std::string file_sha1, std::vector<std::string> expected_hashes, std::vector<std::pair<std::string, int>> peer_addrs, Client *cl) {
+void download_coordinator_thread(std::string group_id, std::string file_name, std::string dest_path, std::string sharing_user, size_t file_size, std::string file_sha1, std::vector<std::string> expected_hashes, std::vector<std::pair<std::string, int>> peer_addrs, Client *cl) {
     std::vector<int> peer_socks;
     std::vector<std::string> peer_bitfields;
 
@@ -510,7 +532,7 @@ void download_coordinator_thread(std::string group_id, std::string file_name, st
 
     std::vector<std::thread> workers;
     for (size_t i = 0; i < peer_socks.size(); i++) {
-        workers.push_back(std::thread(peer_download_worker, peer_socks[i], peer_bitfields[i], group_id, file_name, dest_path, sharing_user, expected_hashes, &queue, cl));
+        workers.push_back(std::thread(peer_download_worker, i, peer_socks[i], peer_bitfields[i], group_id, file_name, dest_path, sharing_user, file_size, expected_hashes, &queue, cl));
     }
 
     for (auto &t : workers) {
@@ -777,7 +799,7 @@ void run_cli(Client *cl) {
             cl->update_download_progress(gid, fname, 0, pieces_count, p_status, false, "Downloading");
 
             // Start coordinator thread
-            std::thread th(download_coordinator_thread, gid, fname, dest_path, cl->username, file_sha1, piece_hashes, peer_addrs, cl);
+            std::thread th(download_coordinator_thread, gid, fname, dest_path, cl->username, fsize, file_sha1, piece_hashes, peer_addrs, cl);
             th.detach();
 
             std::cout << "SUCCESS download started" << std::endl;
