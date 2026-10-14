@@ -18,6 +18,8 @@
 #include <sys/stat.h>
 #include <chrono>
 #include <cstdlib>
+#include <cerrno>
+#include <fcntl.h>
 
 Client client_inst;
 
@@ -31,7 +33,8 @@ struct PieceQueue {
     std::vector<size_t> frequencies;
     size_t active_pieces = 0;
 
-    void initialize(size_t num_pieces, const std::vector<std::string> &peer_bitfields) {
+    void initialize(size_t num_pieces, const std::vector<std::string> &peer_bitfields,
+                    const std::vector<bool> &completed) {
         frequencies.assign(num_pieces, 0);
         for (size_t i = 0; i < num_pieces; i++) {
             for (const auto &bf : peer_bitfields) {
@@ -41,7 +44,8 @@ struct PieceQueue {
             }
         }
 
-        for (size_t i = 0; i < num_pieces; i++) pending_pieces.push_back(i);
+        for (size_t i = 0; i < num_pieces; i++)
+            if (i >= completed.size() || !completed[i]) pending_pieces.push_back(i);
 
         // Sort rarest-first
         std::sort(pending_pieces.begin(), pending_pieces.end(), [this](size_t a, size_t b) {
@@ -90,6 +94,130 @@ struct PieceQueue {
         cv.notify_all();
     }
 };
+
+constexpr size_t PIECE_SIZE = 524288;
+
+std::string resume_path(const std::string &destination) {
+    return destination + ".dfs.resume";
+}
+
+std::string metadata_identity(const std::string &group_id, const std::string &file_name,
+                              size_t file_size, const std::string &file_sha1,
+                              const std::vector<std::string> &piece_sha1s) {
+    std::string metadata = group_id + "\n" + file_name + "\n" +
+                           std::to_string(file_size) + "\n" + file_sha1 + "\n";
+    for (const auto &hash : piece_sha1s) metadata += hash + "\n";
+    return SHA1::hash_string(metadata);
+}
+
+bool checkpoint_matches(const std::string &path, const std::string &identity) {
+    std::ifstream file(path);
+    if (!file.is_open()) return true; // Rebuild missing state from the file bytes.
+    std::string version, saved_identity;
+    if (!std::getline(file, version) || !std::getline(file, saved_identity) ||
+        version != "DFS_RESUME_V1" || saved_identity.size() != 40)
+        return true; // A damaged snapshot is recoverable.
+    return saved_identity == identity;
+}
+
+bool write_all_fd(int fd, const char *data, size_t length) {
+    size_t written = 0;
+    while (written < length) {
+        ssize_t count = write(fd, data + written, length - written);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) return false;
+        written += static_cast<size_t>(count);
+    }
+    return true;
+}
+
+bool persist_checkpoint(const std::string &destination, const std::string &identity,
+                        const std::vector<bool> &pieces) {
+    std::string bitmap;
+    bitmap.reserve(pieces.size());
+    for (bool piece : pieces) bitmap += piece ? '1' : '0';
+    const std::string data = "DFS_RESUME_V1\n" + identity + "\n" + bitmap + "\n";
+    const std::string path = resume_path(destination);
+    const std::string temporary = path + ".tmp";
+    int fd = open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return false;
+    bool okay = write_all_fd(fd, data.data(), data.size()) && fsync(fd) == 0;
+    if (close(fd) != 0) okay = false;
+    if (!okay || std::rename(temporary.c_str(), path.c_str()) != 0) {
+        std::remove(temporary.c_str());
+        return false;
+    }
+    size_t slash = path.find_last_of('/');
+    std::string directory = slash == std::string::npos ? "." : path.substr(0, slash);
+    int directory_fd = open(directory.c_str(), O_RDONLY);
+    if (directory_fd >= 0) {
+        fsync(directory_fd);
+        close(directory_fd);
+    }
+    return true;
+}
+
+bool prepare_download_file(const std::string &destination, size_t file_size,
+                           const std::vector<std::string> &expected_hashes,
+                           const std::string &identity, std::vector<bool> &verified,
+                           std::string &error) {
+    if (!checkpoint_matches(resume_path(destination), identity)) {
+        error = "destination checkpoint belongs to different file content";
+        return false;
+    }
+    int fd = open(destination.c_str(), O_RDWR | O_CREAT, 0600);
+    if (fd < 0) {
+        error = "cannot open destination file";
+        return false;
+    }
+    struct stat details{};
+    if (fstat(fd, &details) != 0 || details.st_size < 0) {
+        error = "cannot inspect destination file";
+        close(fd);
+        return false;
+    }
+    const size_t old_size = static_cast<size_t>(details.st_size);
+    verified.assign(expected_hashes.size(), false);
+    std::vector<char> buffer(PIECE_SIZE);
+    for (size_t index = 0; index < expected_hashes.size(); ++index) {
+        const size_t offset = index * PIECE_SIZE;
+        const size_t length = std::min(PIECE_SIZE, file_size - offset);
+        if (old_size < offset + length) continue;
+        ssize_t count = pread(fd, buffer.data(), length, static_cast<off_t>(offset));
+        if (count != static_cast<ssize_t>(length)) continue;
+        SHA1 digest;
+        digest.update(reinterpret_cast<const unsigned char *>(buffer.data()), length);
+        verified[index] = digest.final() == expected_hashes[index];
+    }
+    if (ftruncate(fd, static_cast<off_t>(file_size)) != 0) {
+        error = "cannot resize destination file";
+        close(fd);
+        return false;
+    }
+    close(fd);
+    if (!persist_checkpoint(destination, identity, verified)) {
+        error = "cannot save download checkpoint";
+        return false;
+    }
+    return true;
+}
+
+bool write_verified_piece(const std::string &destination, size_t offset,
+                          const std::vector<char> &bytes) {
+    int fd = open(destination.c_str(), O_RDWR);
+    if (fd < 0) return false;
+    size_t written = 0;
+    while (written < bytes.size()) {
+        ssize_t count = pwrite(fd, bytes.data() + written, bytes.size() - written,
+                               static_cast<off_t>(offset + written));
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) break;
+        written += static_cast<size_t>(count);
+    }
+    bool okay = written == bytes.size() && fsync(fd) == 0;
+    if (close(fd) != 0) okay = false;
+    return okay;
+}
 
 void Client::load_local_files_db() {
     std::lock_guard<std::mutex> lock(files_mtx);
@@ -206,7 +334,8 @@ void Client::show_downloads() {
             if (dp.total_pieces > 0) {
                 pct = (dp.downloaded_pieces * 100) / dp.total_pieces;
             }
-            std::cout << "[D] [" << dp.group_id << "] " << dp.file_name << " - " << pct << "%" << std::endl;
+            std::cout << "[D] [" << dp.group_id << "] " << dp.file_name << " - "
+                      << pct << "% (" << dp.status_str << ")" << std::endl;
         }
     }
 }
@@ -479,7 +608,7 @@ void peer_server(int server_fd, Client *cl) {
 }
 
 // Individual Peer Downloader Worker Thread
-void peer_download_worker(size_t peer_index, int sock, std::string peer_bitfield, std::string group_id, std::string file_name, std::string dest_path, std::string sharing_user, size_t file_size, const std::vector<std::string> &expected_hashes, PieceQueue *queue, Client *cl) {
+void peer_download_worker(size_t peer_index, int sock, std::string peer_bitfield, std::string group_id, std::string file_name, std::string dest_path, std::string sharing_user, size_t file_size, const std::vector<std::string> &expected_hashes, const std::string &identity, PieceQueue *queue, Client *cl) {
     size_t piece_idx;
     static std::mutex file_write_mtx;
 
@@ -508,8 +637,8 @@ void peer_download_worker(size_t peer_index, int sock, std::string peer_bitfield
             queue->retry(peer_index, piece_idx, false);
             break;
         }
-        const size_t offset = piece_idx * 524288;
-        const size_t expected_len = std::min<size_t>(524288, file_size - offset);
+        const size_t offset = piece_idx * PIECE_SIZE;
+        const size_t expected_len = std::min<size_t>(PIECE_SIZE, file_size - offset);
         if (data_len != expected_len) {
             queue->retry(peer_index, piece_idx, false);
             break;
@@ -534,31 +663,25 @@ void peer_download_worker(size_t peer_index, int sock, std::string peer_bitfield
         // Write piece to disk
         {
             std::lock_guard<std::mutex> file_lock(file_write_mtx);
-            std::fstream file(dest_path, std::ios::in | std::ios::out | std::ios::binary);
-            if (file.is_open()) {
-                file.seekp(piece_idx * 524288, std::ios::beg);
-                file.write(buffer.data(), data_len);
-                file.flush();
-                if (!file.good()) {
-                    queue->retry(peer_index, piece_idx, false);
-                    break;
-                }
-                file.close();
-            } else {
+            if (!write_verified_piece(dest_path, offset, buffer)) {
                 queue->retry(peer_index, piece_idx, false);
                 break;
             }
-        }
-
-        // Update progress
-        {
-            std::lock_guard<std::mutex> lock(cl->downloads_mtx);
-            std::string key = group_id + ":" + file_name;
-            auto it = cl->downloads.find(key);
-            if (it != cl->downloads.end()) {
-                it->second.pieces_status[piece_idx] = true;
-                it->second.downloaded_pieces++;
+            std::vector<bool> snapshot;
+            {
+                std::lock_guard<std::mutex> lock(cl->downloads_mtx);
+                std::string key = group_id + ":" + file_name;
+                auto it = cl->downloads.find(key);
+                if (it != cl->downloads.end()) {
+                    if (!it->second.pieces_status[piece_idx])
+                        it->second.downloaded_pieces++;
+                    it->second.pieces_status[piece_idx] = true;
+                    it->second.status_str = "Downloading";
+                    snapshot = it->second.pieces_status;
+                }
             }
+            if (!snapshot.empty() && !persist_checkpoint(dest_path, identity, snapshot))
+                std::cerr << "Warning: could not update download checkpoint for " << dest_path << std::endl;
         }
         queue->complete(piece_idx);
         cl->announce_verified_pieces(group_id, file_name, dest_path, sharing_user);
@@ -566,13 +689,55 @@ void peer_download_worker(size_t peer_index, int sock, std::string peer_bitfield
     close(sock);
 }
 
+enum class PeerRefresh { Available, Unavailable, ChangedFile };
+
+PeerRefresh refresh_download_peers(Client *cl, const std::string &group_id,
+                                   const std::string &file_name, const std::string &user,
+                                   size_t file_size, const std::string &file_sha1,
+                                   const std::vector<std::string> &expected_hashes,
+                                   std::vector<std::pair<std::string, int>> &peers) {
+    const std::string response = cl->send_to_tracker("DOWNLOAD_FILE " + group_id + " " +
+                                                      user + " " + file_name);
+    auto fields = Utils::split(response, ' ');
+    if (fields.size() < 4 || fields[0] != "SUCCESS") return PeerRefresh::Unavailable;
+    size_t received_size = 0;
+    try { received_size = std::stoull(fields[1]); }
+    catch (const std::exception &) { return PeerRefresh::Unavailable; }
+    std::vector<std::string> hashes;
+    size_t cursor = 3;
+    while (cursor < fields.size() && fields[cursor] != "PEERS") hashes.push_back(fields[cursor++]);
+    if (cursor == fields.size() || received_size != file_size ||
+        fields[2] != file_sha1 || hashes != expected_hashes)
+        return PeerRefresh::ChangedFile;
+    peers.clear();
+    for (++cursor; cursor < fields.size(); ++cursor) {
+        auto peer = Utils::parse_ip_port(fields[cursor]);
+        if (peer.second != 0) peers.push_back(peer);
+    }
+    return PeerRefresh::Available;
+}
+
 // Download Coordinator Thread
 void download_coordinator_thread(std::string group_id, std::string file_name, std::string dest_path, std::string sharing_user, size_t file_size, std::string file_sha1, std::vector<std::string> expected_hashes, std::vector<std::pair<std::string, int>> peer_addrs, Client *cl) {
-    std::vector<int> peer_socks;
-    std::vector<std::string> peer_bitfields;
+    const std::string key = group_id + ":" + file_name;
+    const std::string identity = metadata_identity(group_id, file_name, file_size,
+                                                   file_sha1, expected_hashes);
+    while (cl->logged_in) {
+        std::vector<bool> completed;
+        {
+            std::lock_guard<std::mutex> lock(cl->downloads_mtx);
+            completed = cl->downloads[key].pieces_status;
+        }
+        if (std::all_of(completed.begin(), completed.end(), [](bool piece) { return piece; }))
+            break;
+        if (std::find(completed.begin(), completed.end(), true) != completed.end())
+            cl->announce_verified_pieces(group_id, file_name, dest_path, sharing_user);
 
-    // Connect to all peers and get their bitfields
-    for (const auto &peer : peer_addrs) {
+        std::vector<int> peer_socks;
+        std::vector<std::string> peer_bitfields;
+        // Each retry observes current peers and bitfields, including peers that
+        // arrived while the download was paused.
+        for (const auto &peer : peer_addrs) {
         // Do not connect to ourselves
         if (peer.first == cl->my_ip && peer.second == cl->my_port) {
             continue;
@@ -615,29 +780,34 @@ void download_coordinator_thread(std::string group_id, std::string file_name, st
         } else {
             close(sock);
         }
-    }
+        }
 
-    std::string key = group_id + ":" + file_name;
-
-    if (peer_socks.empty()) {
-        std::cout << "\nError: No seeders online for file " << file_name << std::endl;
+        if (!peer_socks.empty()) {
+            PieceQueue queue;
+            queue.initialize(expected_hashes.size(), peer_bitfields, completed);
+            std::vector<std::thread> workers;
+            for (size_t i = 0; i < peer_socks.size(); i++) {
+                workers.push_back(std::thread(peer_download_worker, i, peer_socks[i], peer_bitfields[i], group_id, file_name, dest_path, sharing_user, file_size, expected_hashes, std::cref(identity), &queue, cl));
+            }
+            for (auto &worker : workers) worker.join();
+        }
         {
             std::lock_guard<std::mutex> lock(cl->downloads_mtx);
-            cl->downloads[key].status_str = "Failed (No active seeders)";
+            if (cl->downloads[key].downloaded_pieces == cl->downloads[key].total_pieces)
+                continue;
+            cl->downloads[key].status_str = "Paused (waiting for available pieces)";
         }
-        return;
-    }
-
-    PieceQueue queue;
-    queue.initialize(expected_hashes.size(), peer_bitfields);
-
-    std::vector<std::thread> workers;
-    for (size_t i = 0; i < peer_socks.size(); i++) {
-        workers.push_back(std::thread(peer_download_worker, i, peer_socks[i], peer_bitfields[i], group_id, file_name, dest_path, sharing_user, file_size, expected_hashes, &queue, cl));
-    }
-
-    for (auto &t : workers) {
-        t.join();
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        PeerRefresh result = refresh_download_peers(cl, group_id, file_name, sharing_user,
+                                                     file_size, file_sha1, expected_hashes,
+                                                     peer_addrs);
+        if (result == PeerRefresh::ChangedFile) {
+            std::lock_guard<std::mutex> lock(cl->downloads_mtx);
+            cl->downloads[key].status_str = "Failed (file metadata changed)";
+            std::cout << "\nError: Tracker file metadata changed during download" << std::endl;
+            return;
+        }
+        if (result == PeerRefresh::Unavailable) peer_addrs.clear();
     }
 
     // Check final status
@@ -667,6 +837,7 @@ void download_coordinator_thread(std::string group_id, std::string file_name, st
             }
             std::cout << "\n[C] [" << group_id << "] " << file_name << std::endl;
             cl->add_shared_file(group_id, file_name, dest_path);
+            std::remove(resume_path(dest_path).c_str());
         } else {
             std::cout << "\nError: Integrity check failed for " << file_name << ". Redownload required." << std::endl;
             std::lock_guard<std::mutex> lock(cl->downloads_mtx);
@@ -847,18 +1018,34 @@ void run_cli(Client *cl) {
             for (size_t i = 5; i < tokens.size(); i++) {
                 dest_path += " " + tokens[i];
             }
+            {
+                std::lock_guard<std::mutex> lock(cl->downloads_mtx);
+                auto existing = cl->downloads.find(gid + ":" + fname);
+                if (existing != cl->downloads.end() &&
+                    (existing->second.status_str == "Downloading" ||
+                     existing->second.status_str == "Verifying" ||
+                     existing->second.status_str.rfind("Paused", 0) == 0)) {
+                    std::cout << "ERROR download already active" << std::endl;
+                    continue;
+                }
+            }
 
             std::string cmd = "DOWNLOAD_FILE " + gid + " " + cl->username + " " + fname;
             std::string res = cl->send_to_tracker(cmd);
 
             std::vector<std::string> res_tokens = Utils::split(res, ' ');
-            if (res_tokens.empty() || res_tokens[0] != "SUCCESS") {
+            if (res_tokens.size() < 4 || res_tokens[0] != "SUCCESS") {
                 std::cout << res << std::endl;
                 continue;
             }
 
             // Parse: SUCCESS <size> <file_sha1> <hashes...> PEERS <peers...>
-            size_t fsize = std::stoull(res_tokens[1]);
+            size_t fsize = 0;
+            try { fsize = std::stoull(res_tokens[1]); }
+            catch (const std::exception &) {
+                std::cout << "ERROR invalid tracker file size" << std::endl;
+                continue;
+            }
             std::string file_sha1 = res_tokens[2];
 
             std::vector<std::string> piece_hashes;
@@ -870,6 +1057,11 @@ void run_cli(Client *cl) {
                 cursor++;
             }
 
+            if (cursor == res_tokens.size() ||
+                piece_hashes.size() != (fsize + PIECE_SIZE - 1) / PIECE_SIZE) {
+                std::cout << "ERROR invalid tracker piece metadata" << std::endl;
+                continue;
+            }
             cursor++; // skip PEERS
             while (cursor < res_tokens.size()) {
                 auto p = Utils::parse_ip_port(res_tokens[cursor]);
@@ -879,22 +1071,27 @@ void run_cli(Client *cl) {
                 cursor++;
             }
 
-            // Allocate blank file on destination path
-            std::ofstream newfile(dest_path, std::ios::binary | std::ios::out);
-            if (!newfile.is_open()) {
-                std::cout << "ERROR cannot open destination file for allocation: " << dest_path << std::endl;
+            size_t pieces_count = piece_hashes.size();
+            std::vector<bool> p_status;
+            std::string error;
+            std::string identity = metadata_identity(gid, fname, fsize, file_sha1, piece_hashes);
+            if (!prepare_download_file(dest_path, fsize, piece_hashes, identity,
+                                       p_status, error)) {
+                std::cout << "ERROR " << error << std::endl;
                 continue;
             }
-            if (fsize > 0) {
-                newfile.seekp(fsize - 1);
-                newfile.write("", 1);
+            size_t recovered = std::count(p_status.begin(), p_status.end(), true);
+            cl->update_download_progress(gid, fname, recovered, pieces_count, p_status,
+                                         false, "Downloading");
+            {
+                std::lock_guard<std::mutex> lock(cl->downloads_mtx);
+                auto &record = cl->downloads[gid + ":" + fname];
+                record.destination_path = dest_path;
+                record.file_size = fsize;
             }
-            newfile.close();
-
-            // Setup download record
-            size_t pieces_count = piece_hashes.size();
-            std::vector<bool> p_status(pieces_count, false);
-            cl->update_download_progress(gid, fname, 0, pieces_count, p_status, false, "Downloading");
+            if (recovered > 0)
+                std::cout << "[System] Recovered " << recovered << "/" << pieces_count
+                          << " verified pieces" << std::endl;
 
             // Start coordinator thread
             std::thread th(download_coordinator_thread, gid, fname, dest_path, cl->username, fsize, file_sha1, piece_hashes, peer_addrs, cl);

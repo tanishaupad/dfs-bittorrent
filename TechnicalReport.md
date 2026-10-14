@@ -30,10 +30,10 @@ To maximize transfer efficiency and piece distribution in the network, we implem
 2. **Handshake**: The client opens TCP connections in parallel to all seeders and requests their bitfields using `GET_BITFIELD`.
 3. **Frequency Mapping**: The coordinator thread computes the frequency of each piece index (i.e. how many seeders possess that chunk) and initializes a `PieceQueue` sorted in ascending order of frequency.
 4. **Worker Allocation**: A pool of downloader threads is allocated (one thread per connected seeder). Since sockets are stream-oriented, dedicating one thread to a single peer connection eliminates socket read/write concurrency issues and locks.
-5. **Rarest Download Loop**: Each worker thread queries the queue for the rarest piece available on its assigned peer. It downloads the piece, verifies its SHA-1 hash against the tracker metadata, writes it to disk at the exact offset using concurrent file streams, and marks the piece as complete.
-6. **Error Handling**: If a chunk hash fails, the scheduler excludes that peer for the piece and returns the piece to the queue. If the peer disconnects, its in-flight piece returns to the queue. Idle workers wait for in-flight work to finish before deciding there is no more work they can serve.
+5. **Rarest Download Loop**: Each worker thread queries the queue for the rarest piece available on its assigned peer. It downloads the piece, verifies its SHA-1 hash against the tracker metadata, writes it at the exact offset, syncs the bytes, and then updates an atomic per-destination checkpoint containing a verified-piece bitmap.
+6. **Error Handling**: If a chunk hash fails, the scheduler excludes that peer for the piece and returns the piece to the queue. If a peer disconnects or the current bitfields cannot supply every missing piece, the coordinator refreshes tracker peers and bitfields every two seconds. The download remains paused until a source returns or the client exits.
 
-After a verified piece is written, the downloader exposes its local bitfield and registers with the tracker. This allows other clients to discover and request that piece before the downloader finishes. The file path is persisted as a complete local share only after the whole-file SHA-1 check succeeds. Peer lists and bitfields are currently sampled at download start; live availability refresh remains future work.
+After a verified piece is written, the downloader exposes its local bitfield and registers with the tracker. This allows other clients to discover and request that piece before the downloader finishes. The file path is persisted as a complete local share only after the whole-file SHA-1 check succeeds. On client restart, issuing `download file` with the same destination hashes all existing pieces against the current tracker metadata. This recovers valid bytes even if the latest checkpoint is missing, and replaces damaged pieces. A checkpoint bound to a different file identity is rejected rather than silently reused.
 
 ---
 
@@ -80,8 +80,8 @@ Trackers authenticate journal connections with a shared secret. The same run dir
 
 | Mode | Second downloader starts | Median completion | First downloader upload |
 | --- | --- | ---: | ---: |
-| Centralized | Immediately; only original source serves | 3.6361 s | 0 MiB |
-| Cooperative | After first peer advertises a verified piece | 3.5051 s | 1 MiB |
-| Seeded | After first peer finishes and can seed the whole file | 2.9709 s | 4 MiB |
+| Centralized | Immediately; only original source serves | 0.9376 s | 0 MiB |
+| Cooperative | After first peer advertises a verified piece | 0.8113 s | 2.5 MiB |
+| Seeded | After first peer finishes and can seed the whole file | 0.8221 s | 4 MiB |
 
-The cooperative mode was 1.037 times as fast as the centralized mode; the seeded mode was 1.224 times as fast. The limited gain during partial sharing follows from the current downloader's one-time bitfield snapshot: the second downloader does not learn about pieces its peer acquires later. These are local measurements with an artificial delay and a small sample, so they do not predict performance on a real network. Refreshing peer availability during downloads is the next performance improvement to evaluate.
+The cooperative mode was 1.156 times as fast as the centralized mode; the seeded mode was 1.140 times as fast. The downloader now refreshes peers and bitfields after a round stalls, allowing partial sharing to contribute more upload bytes than in the earlier run. These are local measurements with an artificial delay and a small sample, so they do not predict performance on a real network.

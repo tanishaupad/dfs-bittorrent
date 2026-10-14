@@ -1,77 +1,77 @@
 {
-  "date_utc": "2026-10-14T16:13:24.251023+00:00",
+  "date_utc": "2026-10-14T20:07:53.709207+00:00",
   "file_size_bytes": 8388608,
   "upload_delay_ms_per_piece": 25,
   "trials_per_mode": 3,
   "environment": "single host, loopback TCP, two trackers, three C++ clients",
-  "centralized_median_seconds": 3.6361,
-  "cooperative_median_seconds": 3.5051,
-  "seeded_median_seconds": 2.9709,
-  "cooperative_relative_speedup": 1.037,
-  "seeded_relative_speedup": 1.224,
+  "centralized_median_seconds": 0.9376,
+  "cooperative_median_seconds": 0.8113,
+  "seeded_median_seconds": 0.8221,
+  "cooperative_relative_speedup": 1.156,
+  "seeded_relative_speedup": 1.14,
   "runs": [
     {
       "mode": "centralized",
       "trial": 1,
-      "seconds": 3.6361,
+      "seconds": 0.935,
       "source_uploaded_bytes": 16777216,
       "peer_uploaded_bytes": 0
     },
     {
       "mode": "cooperative",
       "trial": 1,
-      "seconds": 3.5051,
-      "source_uploaded_bytes": 15728640,
-      "peer_uploaded_bytes": 1048576
+      "seconds": 0.8089,
+      "source_uploaded_bytes": 14155776,
+      "peer_uploaded_bytes": 2621440
     },
     {
       "mode": "seeded",
       "trial": 1,
-      "seconds": 2.9854,
+      "seconds": 0.8221,
       "source_uploaded_bytes": 12582912,
       "peer_uploaded_bytes": 4194304
     },
     {
       "mode": "cooperative",
       "trial": 2,
-      "seconds": 3.5008,
-      "source_uploaded_bytes": 15728640,
-      "peer_uploaded_bytes": 1048576
+      "seconds": 0.8113,
+      "source_uploaded_bytes": 14155776,
+      "peer_uploaded_bytes": 2621440
     },
     {
       "mode": "seeded",
       "trial": 2,
-      "seconds": 2.9709,
+      "seconds": 0.832,
       "source_uploaded_bytes": 12582912,
       "peer_uploaded_bytes": 4194304
     },
     {
       "mode": "centralized",
       "trial": 2,
-      "seconds": 3.2922,
+      "seconds": 0.9432,
       "source_uploaded_bytes": 16777216,
       "peer_uploaded_bytes": 0
     },
     {
       "mode": "seeded",
       "trial": 3,
-      "seconds": 2.9621,
+      "seconds": 0.8198,
       "source_uploaded_bytes": 12582912,
       "peer_uploaded_bytes": 4194304
     },
     {
       "mode": "centralized",
       "trial": 3,
-      "seconds": 3.799,
+      "seconds": 0.9376,
       "source_uploaded_bytes": 16777216,
       "peer_uploaded_bytes": 0
     },
     {
       "mode": "cooperative",
       "trial": 3,
-      "seconds": 3.5634,
-      "source_uploaded_bytes": 15728640,
-      "peer_uploaded_bytes": 1048576
+      "seconds": 0.8212,
+      "source_uploaded_bytes": 14155776,
+      "peer_uploaded_bytes": 2621440
     }
   ]
 }

@@ -74,6 +74,8 @@ class PeerHandler(socketserver.BaseRequestHandler):
                 if len(fields) >= 4 and fields[0] == "AUTH":
                     fields = fields[3:]
                 if len(fields) == 3 and fields[0] == "GET_BITFIELD":
+                    if self.server.behavior == "offline":
+                        return
                     pieces = self.server.files.get(fields[2])
                     bits = "1" * len(pieces)
                     if self.server.behavior in ("corrupt", "disconnect"):
@@ -83,6 +85,8 @@ class PeerHandler(socketserver.BaseRequestHandler):
                     name, index = fields[2], int(fields[3])
                     with self.server.lock:
                         self.server.requests.append((name, index))
+                    if self.server.behavior == "offline":
+                        return
                     if self.server.behavior == "disconnect" and index == 0:
                         return
                     piece = self.server.files[name][index]
