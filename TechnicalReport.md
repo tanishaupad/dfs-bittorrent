@@ -15,9 +15,11 @@ The project is built entirely in C++17 using standard networking and system APIs
 
 ## 2. Tracker Synchronization Algorithm Design
 
-Each tracker persists accepted changes in `tracker<no>_journal.txt` with a unique `<tracker>:<sequence>` identifier. A background worker requests the other tracker's journal using `SYNC_PULL`, applies unseen entries, and sends its own entries using `SYNC_OP`. The receiver answers `SYNC_ACK <id>` only when an entry is already known or has been applied and appended locally; failed applications receive `SYNC_NACK <id>`. This avoids treating failed replay as success and avoids overwriting local state on startup.
+Each tracker persists accepted changes in `tracker<no>_journal.txt` with a unique `<tracker>:<sequence>` identifier and a two-counter vector clock. A background worker requests the other tracker's journal using `SYNC_PULL`, applies unseen entries, and sends its own entries using `SYNC_OP`. The receiver answers `SYNC_ACK <id>` only when an entry is already known or has been applied and appended locally; failed applications receive `SYNC_NACK <id>`. This avoids treating failed replay as success and avoids overwriting local state on startup.
 
-Trackers also save atomic state snapshots. On restart, they load their snapshot and journal, or replay the journal if the snapshot is absent. When both trackers accept independent changes during a separation, they continue serving their local view and exchange the missing operations after reconnection. Their answers may differ during the separation. Concurrent conflicting edits to the same identifier are not resolved deterministically by this design and remain a limitation.
+Trackers also save atomic state snapshots. On restart, they load their snapshot and journal, or replay the journal if the snapshot is absent. When both trackers accept independent changes during a separation, they continue serving their local view and exchange the missing operations after reconnection. Their answers may differ during the separation. For membership, request IDs bind approvals to one join request, and the vector clocks make a removal win over concurrent or earlier approvals. A later join and approval may restore access.
+
+New usernames, group IDs, and filenames are assigned only by tracker 1, preventing both trackers from accepting competing claims during a partition. Tracker 2 may add a seeder to an existing file only when its size, full SHA-1, and piece SHA-1 list match the registered metadata; a different file must use a different name. If tracker 1 is unavailable, new identity creation waits for its return. The system has no automatic leader promotion or quorum, and previously divergent data would require manual repair.
 
 ---
 

@@ -483,15 +483,19 @@ bool TrackerState::upload_file(const std::string &group_id, const std::string &u
         sf.seeders.insert(username);
         files[key] = sf;
     } else {
+        // A filename identifies immutable content. Equal content can gain
+        // another seeder; conflicting metadata must use a different name.
+        if (f_it->second.file_size != file_size ||
+            f_it->second.file_sha1 != file_sha1 ||
+            f_it->second.piece_sha1s != piece_sha1s) return false;
         f_it->second.seeders.insert(username);
-        // If piece details are missing (e.g. from seed registration), populate them
-        if (f_it->second.file_size == 0 && file_size > 0) {
-            f_it->second.file_size = file_size;
-            f_it->second.file_sha1 = file_sha1;
-            f_it->second.piece_sha1s = piece_sha1s;
-        }
     }
     return true;
+}
+
+bool TrackerState::file_exists(const std::string &group_id, const std::string &file_name) {
+    std::lock_guard<std::mutex> lock(mtx);
+    return files.count(group_id + ":" + file_name) != 0;
 }
 
 bool TrackerState::register_peer(const std::string &group_id, const std::string &username, const std::string &file_name) {
@@ -755,6 +759,8 @@ std::string handle_command(const std::string &cmd_raw, bool is_sync, std::string
 
     if (cmd == "CREATE_USER") {
         if (tokens.size() < 3) return "ERROR invalid args";
+        if (!is_sync && local_tracker_no != 1)
+            return "ERROR new usernames must be created on tracker 1";
         std::string username = tokens[1];
         std::string pwd_hash = tokens[2];
         if (state.create_user(username, pwd_hash)) {
@@ -803,6 +809,8 @@ std::string handle_command(const std::string &cmd_raw, bool is_sync, std::string
     }
     else if (cmd == "CREATE_GROUP") {
         if (tokens.size() < 3) return "ERROR invalid args";
+        if (!is_sync && local_tracker_no != 1)
+            return "ERROR new groups must be created on tracker 1";
         std::string group_id = tokens[1];
         std::string username = tokens[2];
         if (state.create_group(group_id, username)) {
@@ -889,12 +897,15 @@ std::string handle_command(const std::string &cmd_raw, bool is_sync, std::string
         for (size_t i = 6; i < tokens.size(); i++) {
             piece_sha1s.push_back(tokens[i]);
         }
+        if (!is_sync && local_tracker_no != 1 &&
+            !state.file_exists(group_id, file_name))
+            return "ERROR new filenames must be registered on tracker 1";
         if (state.upload_file(group_id, username, file_name, file_size, file_sha1, piece_sha1s)) {
             state.save_to_file(state_file);
             if (!is_sync) queue_sync(cmd_str);
             return "SUCCESS";
         }
-        return "ERROR upload failed (group not found or not member)";
+        return "ERROR upload failed (group, membership, or file metadata conflict)";
     }
     else if (cmd == "REGISTER_SEEDER") {
         if (tokens.size() < 4) return "ERROR invalid args";

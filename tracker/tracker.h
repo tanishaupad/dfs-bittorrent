@@ -80,6 +80,7 @@ public:
     std::string pending_request_id(const std::string &group_id, const std::string &username);
     std::string approved_request_id(const std::string &group_id, const std::string &username);
     bool upload_file(const std::string &group_id, const std::string &username, const std::string &file_name, size_t file_size, const std::string &file_sha1, const std::vector<std::string> &piece_sha1s);
+    bool file_exists(const std::string &group_id, const std::string &file_name);
     bool register_peer(const std::string &group_id, const std::string &username, const std::string &file_name);
     std::vector<std::string> list_files(const std::string &group_id, const std::string &username, bool &is_member);
     bool download_file(const std::string &group_id, const std::string &username, const std::string &file_name, size_t &file_size, std::string &file_sha1, std::vector<std::string> &piece_sha1s, std::vector<std::pair<std::string, int>> &peers);

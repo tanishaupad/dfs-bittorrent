@@ -1,4 +1,4 @@
-"""Test two trackers accepting independent writes during a partition and healing.
+"""Test safe independent writes during a partition and healing.
 
 The partition uses separate tracker config files with unreachable peer ports.
 Both trackers remain available to clients throughout the partition.
@@ -82,17 +82,31 @@ def main():
         healed.write_text(f"127.0.0.1 {p1}\n127.0.0.1 {p2}\n")
         processes = []
         try:
-            t1 = start_tracker(1, broken1, work)
-            t2 = start_tracker(2, broken2, work)
+            t1 = start_tracker(1, healed, work)
+            t2 = start_tracker(2, healed, work)
             processes.extend((t1, t2))
             def ready(port):
                 with socket.create_connection(("127.0.0.1", port), timeout=1):
                     return True
             wait_for(lambda: ready(p1) and ready(p2))
             alice = create_group(p1, "alice", "alpha")
-            bob = create_group(p2, "bob", "beta")
-            assert "beta" not in command(p1, "LIST_GROUPS", alice)
-            assert "alpha" not in command(p2, "LIST_GROUPS", bob)
+            bob = create_group(p1, "bob", "beta")
+            wait_for(lambda: "alpha" in command(p2, "LIST_GROUPS", bob) and
+                     "beta" in command(p2, "LIST_GROUPS", bob))
+            stop(t1)
+            stop(t2)
+            processes.clear()
+
+            t1 = start_tracker(1, broken1, work)
+            t2 = start_tracker(2, broken2, work)
+            processes.extend((t1, t2))
+            wait_for(lambda: ready(p1) and ready(p2))
+            charlie = create_group(p1, "charlie", "gamma")
+            assert command(p2, "JOIN_GROUP alpha bob", bob) == "SUCCESS"
+            assert command(p2, "CREATE_USER blocked " + hashlib.sha1(b"x").hexdigest()).startswith("ERROR")
+            assert command(p2, "CREATE_GROUP blocked bob", bob).startswith("ERROR")
+            assert "gamma" not in command(p2, "LIST_GROUPS", bob)
+            assert command(p1, "LIST_REQUESTS alpha alice", alice) == "SUCCESS"
             stop(t1)
             stop(t2)
             processes.clear()
@@ -100,20 +114,19 @@ def main():
             t1 = start_tracker(1, healed, work)
             t2 = start_tracker(2, healed, work)
             processes.extend((t1, t2))
-            wait_for(lambda: all(group in command(port, "LIST_GROUPS", token)
-                                 for port, token in ((p1, alice), (p2, bob))
-                                 for group in ("alpha", "beta")))
+            wait_for(lambda: "gamma" in command(p2, "LIST_GROUPS", bob) and
+                     command(p1, "LIST_REQUESTS alpha alice", alice) == "SUCCESS bob")
 
             stop(t1)
             processes.remove(t1)
             (work / "tracker1_state.txt").unlink()
-            create_group(p2, "charlie", "gamma")
             t1 = start_tracker(1, healed, work)
             processes.append(t1)
-            wait_for(lambda: "gamma" in command(p1, "LIST_GROUPS", alice))
+            wait_for(lambda: "gamma" in command(p1, "LIST_GROUPS", charlie) and
+                     command(p1, "LIST_REQUESTS alpha alice", alice) == "SUCCESS bob")
             assert set(command(p1, "LIST_GROUPS", alice).split()) == \
                    set(command(p2, "LIST_GROUPS", bob).split())
-            print("PASS: partition edits converged and restarted tracker caught up")
+            print("PASS: safe partition edits converged and restarted tracker caught up")
         finally:
             for process in processes:
                 stop(process)
