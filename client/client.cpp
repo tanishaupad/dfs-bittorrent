@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <cerrno>
 #include <fcntl.h>
+#include <poll.h>
 
 Client client_inst;
 
@@ -430,6 +431,51 @@ std::string Client::send_to_tracker(const std::string &cmd) {
     return response;
 }
 
+// Serving data requires two independent, current approvals. Ordinary client
+// commands may fail over, but a peer request must fail closed on either denial.
+bool Client::verify_peer_with_both_trackers(const std::string &cmd) {
+    std::string token;
+    {
+        std::lock_guard<std::mutex> lock(tracker_mtx);
+        if (!logged_in || session_token.empty()) return false;
+        token = session_token;
+    }
+    const std::string request = "AUTH " + token + " " + cmd;
+    for (const auto &tracker : trackers) {
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) return false;
+        int flags = fcntl(sock, F_GETFL, 0);
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_port = htons(tracker.second);
+        if (flags < 0 || inet_pton(AF_INET, tracker.first.c_str(), &address.sin_addr) != 1 ||
+            fcntl(sock, F_SETFL, flags | O_NONBLOCK) < 0) {
+            close(sock);
+            return false;
+        }
+        int result = connect(sock, reinterpret_cast<sockaddr *>(&address), sizeof(address));
+        if (result < 0 && errno == EINPROGRESS) {
+            pollfd pending{sock, POLLOUT, 0};
+            int connected = poll(&pending, 1, 2000);
+            int error = 0;
+            socklen_t length = sizeof(error);
+            result = connected == 1 && getsockopt(sock, SOL_SOCKET, SO_ERROR, &error, &length) == 0 &&
+                     error == 0 ? 0 : -1;
+        }
+        if (result != 0 || fcntl(sock, F_SETFL, flags) < 0) {
+            close(sock);
+            return false;
+        }
+        struct timeval timeout{2, 0};
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+        bool approved = Utils::send_msg(sock, request) && Utils::recv_msg(sock) == "SUCCESS";
+        close(sock);
+        if (!approved) return false;
+    }
+    return true;
+}
+
 std::string Client::peer_auth_prefix() {
     std::lock_guard<std::mutex> lock(tracker_mtx);
     if (!logged_in || username.empty() || session_token.empty()) return "";
@@ -480,7 +526,7 @@ void peer_connection_handler(int sock, Client *cl) {
         std::string seeder = cl->current_username();
         std::string verification = "VERIFY_PEER " + tokens[1] + " " + tokens[2] + " " +
                                    requester + " " + requester_token + " " + seeder;
-        if (seeder.empty() || cl->send_to_tracker(verification) != "SUCCESS") {
+        if (seeder.empty() || !cl->verify_peer_with_both_trackers(verification)) {
             Utils::send_msg(sock, "ERROR peer access denied");
             continue;
         }

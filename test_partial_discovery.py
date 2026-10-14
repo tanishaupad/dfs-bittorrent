@@ -88,20 +88,21 @@ def main():
         seed_thread = threading.Thread(target=fake_seed, args=(listener, release, seed_errors))
         seed_thread.start()
         try:
-            tracker = subprocess.Popen(
-                [str(ROOT / "tracker/tracker"), str(config), "1"], cwd=work,
-                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-            )
-            processes.append(tracker)
+            for number in (1, 2):
+                tracker = subprocess.Popen(
+                    [str(ROOT / "tracker/tracker"), str(config), str(number)], cwd=work,
+                    stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                )
+                processes.append(tracker)
 
-            def tracker_ready():
+            def tracker_ready(port):
                 try:
-                    with socket.create_connection(("127.0.0.1", tracker_port), timeout=1):
+                    with socket.create_connection(("127.0.0.1", port), timeout=1):
                         return True
                 except OSError:
                     return False
 
-            wait_until(tracker_ready)
+            wait_until(lambda: tracker_ready(tracker_port) and tracker_ready(backup_port))
             tokens = {}
             for user, port in (("seed", seed_port), ("leecher", client_port),
                                ("observer", 9998), ("outsider", 9997)):
@@ -135,6 +136,16 @@ def main():
                 return f"127.0.0.1:{client_port}" in reply
 
             wait_until(leecher_discovered)
+            def approved_by_both():
+                try:
+                    with socket.create_connection(("127.0.0.1", client_port), timeout=3) as peer:
+                        peer.settimeout(3)
+                        peer.sendall(f"AUTH observer {tokens['observer']} GET_BITFIELD group sample.bin\n".encode())
+                        return read_line(peer) == "BITFIELD 100"
+                except (ConnectionError, OSError):
+                    return False
+
+            wait_until(approved_by_both)
             with socket.create_connection(("127.0.0.1", client_port), timeout=3) as peer:
                 peer.settimeout(3)
                 peer.sendall(f"AUTH observer {tokens['observer']} GET_BITFIELD group sample.bin\n".encode())

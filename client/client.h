@@ -50,6 +50,7 @@ public:
 
     bool connect_to_tracker(int &sock);
     std::string send_to_tracker(const std::string &cmd);
+    bool verify_peer_with_both_trackers(const std::string &cmd);
     std::string peer_auth_prefix();
     std::string current_username();
     void set_login_session(const std::string &user, const std::string &pwd, const std::string &token);
