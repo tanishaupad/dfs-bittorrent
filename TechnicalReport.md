@@ -69,3 +69,17 @@ Trackers authenticate journal connections with a shared secret. The same run dir
 1. **RFC 3174**: US Secure Hash Algorithm 1 (SHA1) standard.
 2. **P2P Networks**: BitTorrent piece selection heuristics and bitfield representation principles.
 3. **POSIX Socket Programming**: Standard Linux/macOS TCP socket options (`SO_REUSEADDR`, `SO_RCVTIMEO`, `SO_SNDTIMEO`).
+
+---
+
+## 7. Distribution Benchmark
+
+`benchmark_distribution.py` compared three modes using the same C++ clients, two trackers, an 8 MiB file, and three repetitions per mode on one host over loopback TCP. A process-wide 25 ms delay per 512 KiB upload models a constrained uplink. The timer starts when the first downloader is instructed to begin and stops when both clients report completion; both output SHA-1 hashes are checked. Trial order rotates among modes. The full observations are in `benchmarks/results.json`.
+
+| Mode | Second downloader starts | Median completion | First downloader upload |
+| --- | --- | ---: | ---: |
+| Centralized | Immediately; only original source serves | 3.6361 s | 0 MiB |
+| Cooperative | After first peer advertises a verified piece | 3.5051 s | 1 MiB |
+| Seeded | After first peer finishes and can seed the whole file | 2.9709 s | 4 MiB |
+
+The cooperative mode was 1.037 times as fast as the centralized mode; the seeded mode was 1.224 times as fast. The limited gain during partial sharing follows from the current downloader's one-time bitfield snapshot: the second downloader does not learn about pieces its peer acquires later. These are local measurements with an artificial delay and a small sample, so they do not predict performance on a real network. Refreshing peer availability during downloads is the next performance improvement to evaluate.

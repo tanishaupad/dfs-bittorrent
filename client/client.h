@@ -30,6 +30,7 @@ public:
     std::atomic<bool> logged_in{false};
     std::string session_token;
     std::mutex tracker_mtx;
+    std::atomic<unsigned long long> uploaded_bytes{0};
 
     std::vector<std::pair<std::string, int>> trackers;
     int active_tracker_idx = 0;

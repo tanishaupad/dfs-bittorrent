@@ -16,6 +16,8 @@
 #include <unistd.h>
 #include <csignal>
 #include <sys/stat.h>
+#include <chrono>
+#include <cstdlib>
 
 Client client_inst;
 
@@ -134,6 +136,8 @@ void Client::add_shared_file(const std::string &group_id, const std::string &fil
 
 void Client::announce_verified_pieces(const std::string &group_id, const std::string &file_name,
                                      const std::string &filepath, const std::string &sharing_user) {
+    const char *sharing_disabled = std::getenv("DFS_DISABLE_SHARING");
+    if (sharing_disabled && std::string(sharing_disabled) == "1") return;
     const std::string key = group_id + ":" + file_name;
     {
         std::lock_guard<std::mutex> lock(downloads_mtx);
@@ -150,14 +154,17 @@ void Client::announce_verified_pieces(const std::string &group_id, const std::st
     }
     const std::string response = send_to_tracker("REGISTER_SEEDER " + group_id + " " +
                                                  sharing_user + " " + file_name);
+    const bool announced = response.rfind("SUCCESS", 0) == 0;
     {
         std::lock_guard<std::mutex> lock(downloads_mtx);
         auto it = downloads.find(key);
         if (it != downloads.end()) {
-            it->second.peer_announced = response.rfind("SUCCESS", 0) == 0;
+            it->second.peer_announced = announced;
             it->second.announcing = false;
         }
     }
+    if (announced)
+        std::cout << "[System] Sharing verified pieces for " << group_id << "/" << file_name << std::endl;
 }
 
 bool Client::get_shared_file(const std::string &group_id, const std::string &file_name, std::string &filepath) {
@@ -437,8 +444,18 @@ void peer_connection_handler(int sock, Client *cl) {
                 }
 
                 std::string header = "OK " + std::to_string(read_bytes) + "\n";
-                Utils::write_all(sock, header.data(), header.size());
-                Utils::write_all(sock, buf.data(), read_bytes);
+                const char *delay_setting = std::getenv("DFS_UPLOAD_DELAY_MS");
+                int delay_ms = delay_setting ? std::max(0, std::atoi(delay_setting)) : 0;
+                static std::mutex limited_upload_mtx;
+                std::unique_lock<std::mutex> limit_lock(limited_upload_mtx, std::defer_lock);
+                if (delay_ms > 0) {
+                    limit_lock.lock();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+                }
+                if (Utils::write_all(sock, header.data(), header.size()) ==
+                        static_cast<ssize_t>(header.size()) &&
+                    Utils::write_all(sock, buf.data(), read_bytes) == read_bytes)
+                    cl->uploaded_bytes += static_cast<unsigned long long>(read_bytes);
             } else {
                 Utils::send_msg(sock, "ERROR not sharing this file");
             }
@@ -887,6 +904,9 @@ void run_cli(Client *cl) {
         }
         else if (tokens.size() >= 2 && tokens[0] == "show" && tokens[1] == "downloads") {
             cl->show_downloads();
+        }
+        else if (tokens.size() >= 2 && tokens[0] == "show" && tokens[1] == "stats") {
+            std::cout << "UPLOADED_BYTES " << cl->uploaded_bytes.load() << std::endl;
         }
         else if (tokens.size() >= 4 && tokens[0] == "stop" && tokens[1] == "share") {
             if (!cl->logged_in) {
