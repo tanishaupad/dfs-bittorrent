@@ -93,6 +93,7 @@ bool parse_wire_operation(const std::string &message, JournalEntry &entry) {
 }
 
 std::string handle_command(const std::string &, bool, std::string &);
+std::string execute_command(const std::string &, bool, std::string &, TrackerState &, std::string &);
 
 std::string new_session_token() {
     char bytes[32];
@@ -122,31 +123,61 @@ std::string load_sync_secret() {
 }
 
 bool append_journal(const JournalEntry &entry) {
-    std::ofstream file(journal_file, std::ios::app);
-    if (!file.is_open()) return false;
-    file << entry.id << "\t" << entry.clock[0] << "\t" << entry.clock[1]
-         << "\t" << entry.command << "\n";
-    file.flush();
-    return file.good();
+    const std::string line = entry.id + "\t" + std::to_string(entry.clock[0]) +
+        "\t" + std::to_string(entry.clock[1]) + "\t" + entry.command + "\n";
+    const bool first_entry = access(journal_file.c_str(), F_OK) != 0;
+    int fd = open(journal_file.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (fd < 0) return false;
+    off_t start = lseek(fd, 0, SEEK_END);
+    size_t written = 0;
+    while (written < line.size()) {
+        ssize_t count = write(fd, line.data() + written, line.size() - written);
+        if (count <= 0) break;
+        written += static_cast<size_t>(count);
+    }
+    bool success = written == line.size() && fsync(fd) == 0;
+    if (success && first_entry) {
+        int directory = open(".", O_RDONLY);
+        success = directory >= 0 && fsync(directory) == 0;
+        if (directory >= 0) close(directory);
+    }
+    if (!success && start >= 0) {
+        ftruncate(fd, start);
+        fsync(fd);
+    }
+    close(fd);
+    return success;
 }
 
-void queue_sync(const std::string &cmd) {
+bool record_operation(const JournalEntry &entry) {
     std::lock_guard<std::mutex> lock(journal_mtx);
-    JournalEntry entry{std::to_string(local_tracker_no) + ":" +
-                       std::to_string(++next_operation), command_clock(false), cmd};
-    if (!append_journal(entry)) {
-        std::cerr << "Failed to append tracker operation journal" << std::endl;
-        return;
-    }
-    logical_clock = entry.clock;
+    if (!append_journal(entry)) return false;
+    for (size_t i = 0; i < 2; ++i)
+        logical_clock[i] = std::max(logical_clock[i], entry.clock[i]);
+    std::string prefix = std::to_string(local_tracker_no) + ":";
+    if (entry.id.rfind(prefix, 0) == 0)
+        next_operation = std::max(next_operation, std::stoull(entry.id.substr(prefix.size())));
     seen_operations.insert(entry.id);
     journal.push_back(entry);
+    return true;
 }
 
 void load_journal() {
-    std::ifstream file(journal_file);
+    std::ifstream file(journal_file, std::ios::binary);
+    std::string data((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    size_t complete = data.find_last_of('\n');
+    if (!data.empty() && complete != data.size() - 1) {
+        int fd = open(journal_file.c_str(), O_WRONLY);
+        if (fd >= 0) {
+            ftruncate(fd, complete == std::string::npos ? 0 : complete + 1);
+            fsync(fd);
+            close(fd);
+        }
+        data.resize(complete == std::string::npos ? 0 : complete + 1);
+    }
+    std::istringstream input(data);
     std::string line;
-    while (std::getline(file, line)) {
+    while (std::getline(input, line)) {
         size_t tab = line.find('\t');
         if (tab == std::string::npos) continue;
         std::string id = line.substr(0, tab);
@@ -179,14 +210,24 @@ bool apply_remote_operation(const JournalEntry &entry) {
     }
     incoming_clock = entry.clock;
     std::string ignored;
-    std::string response = handle_command(entry.command, true, ignored);
+    TrackerState staged;
+    {
+        std::lock_guard<std::mutex> lock(state.mtx);
+        staged.users = state.users;
+        staged.groups = state.groups;
+        staged.files = state.files;
+    }
+    std::string normalized;
+    std::string response = execute_command(entry.command, true, ignored, staged, normalized);
     if (response.rfind("SUCCESS", 0) != 0) return false;
-    std::lock_guard<std::mutex> journal_lock(journal_mtx);
-    if (!append_journal(entry)) return false;
-    seen_operations.insert(entry.id);
-    journal.push_back(entry);
-    for (size_t i = 0; i < 2; ++i)
-        logical_clock[i] = std::max(logical_clock[i], entry.clock[i]);
+    if (!record_operation(entry)) return false;
+    {
+        std::lock_guard<std::mutex> lock(state.mtx);
+        state.users = std::move(staged.users);
+        state.groups = std::move(staged.groups);
+        state.files = std::move(staged.files);
+    }
+    state.save_to_file(state_file, journal.size());
     return true;
 }
 
@@ -727,16 +768,30 @@ void TrackerState::deserialize(const std::string &data) {
     }
 }
 
-void TrackerState::save_to_file(const std::string &filepath) {
+void TrackerState::save_to_file(const std::string &filepath, size_t journal_count) {
     const std::string temporary = filepath + ".tmp";
     std::ofstream file(temporary, std::ios::trunc);
     if (!file.is_open()) return;
+    file << "JOURNAL_COUNT " << journal_count << "\n";
     serialize(file);
     file.flush();
     if (!file.good()) return;
     file.close();
+    int fd = open(temporary.c_str(), O_RDONLY);
+    if (fd < 0 || fsync(fd) != 0) {
+        if (fd >= 0) close(fd);
+        return;
+    }
+    close(fd);
     if (std::rename(temporary.c_str(), filepath.c_str()) != 0)
         std::cerr << "Failed to replace tracker state file" << std::endl;
+    else {
+        int directory = open(".", O_RDONLY);
+        if (directory >= 0) {
+            fsync(directory);
+            close(directory);
+        }
+    }
 }
 
 void TrackerState::load_from_file(const std::string &filepath) {
@@ -748,8 +803,10 @@ void TrackerState::load_from_file(const std::string &filepath) {
 }
 
 // Router for command processing
-std::string handle_command(const std::string &cmd_raw, bool is_sync, std::string &associated_username) {
+std::string execute_command(const std::string &cmd_raw, bool is_sync, std::string &associated_username,
+                            TrackerState &target, std::string &journal_command) {
     std::string cmd_str = Utils::trim(cmd_raw);
+    journal_command = cmd_str;
     if (cmd_str.empty()) return "ERROR empty command";
 
     std::vector<std::string> tokens = Utils::split(cmd_str, ' ');
@@ -763,9 +820,7 @@ std::string handle_command(const std::string &cmd_raw, bool is_sync, std::string
             return "ERROR new usernames must be created on tracker 1";
         std::string username = tokens[1];
         std::string pwd_hash = tokens[2];
-        if (state.create_user(username, pwd_hash)) {
-            state.save_to_file(state_file);
-            if (!is_sync) queue_sync(cmd_str);
+        if (target.create_user(username, pwd_hash)) {
             return "SUCCESS";
         }
         return "ERROR user already exists";
@@ -779,10 +834,9 @@ std::string handle_command(const std::string &cmd_raw, bool is_sync, std::string
             int port = std::stoi(tokens[4]);
             std::string token = new_session_token();
             if (token.empty()) return "ERROR unable to create session";
-            if (state.login(username, pwd_hash, ip, port, token)) {
+            if (target.login(username, pwd_hash, ip, port, token)) {
                 associated_username = username;
-                state.save_to_file(state_file);
-                queue_sync("LOGIN_SYNC " + username + " " + ip + " " + std::to_string(port) + " " + token);
+                journal_command = "LOGIN_SYNC " + username + " " + ip + " " + std::to_string(port) + " " + token;
                 return "SUCCESS " + token;
             }
             return "ERROR invalid credentials or user does not exist";
@@ -791,18 +845,15 @@ std::string handle_command(const std::string &cmd_raw, bool is_sync, std::string
     }
     else if (cmd == "LOGIN_SYNC" && is_sync) {
         if (tokens.size() < 5) return "ERROR invalid args";
-        if (!state.login_sync(tokens[1], tokens[2], std::stoi(tokens[3]), tokens[4]))
+        if (!target.login_sync(tokens[1], tokens[2], std::stoi(tokens[3]), tokens[4]))
             return "ERROR user missing during login sync";
-        state.save_to_file(state_file);
         return "SUCCESS";
     }
     else if (cmd == "LOGOUT") {
         if (tokens.size() < 2) return "ERROR invalid args";
         std::string username = tokens[1];
-        if (state.logout(username)) {
+        if (target.logout(username)) {
             if (associated_username == username) associated_username = "";
-            state.save_to_file(state_file);
-            if (!is_sync) queue_sync(cmd_str);
             return "SUCCESS";
         }
         return "ERROR logout failed";
@@ -813,9 +864,7 @@ std::string handle_command(const std::string &cmd_raw, bool is_sync, std::string
             return "ERROR new groups must be created on tracker 1";
         std::string group_id = tokens[1];
         std::string username = tokens[2];
-        if (state.create_group(group_id, username)) {
-            state.save_to_file(state_file);
-            if (!is_sync) queue_sync(cmd_str);
+        if (target.create_group(group_id, username)) {
             return "SUCCESS";
         }
         return "ERROR group already exists";
@@ -826,9 +875,8 @@ std::string handle_command(const std::string &cmd_raw, bool is_sync, std::string
         std::string username = tokens[2];
         std::string request_id = tokens.size() >= 4 ? tokens[3] :
             (is_sync ? "legacy:" + group_id + ":" + username : new_session_token());
-        if (state.join_group(group_id, username, request_id, command_clock(is_sync), is_sync)) {
-            state.save_to_file(state_file);
-            if (!is_sync) queue_sync("JOIN_GROUP " + group_id + " " + username + " " + request_id);
+        if (target.join_group(group_id, username, request_id, command_clock(is_sync), is_sync)) {
+            journal_command = "JOIN_GROUP " + group_id + " " + username + " " + request_id;
             return "SUCCESS";
         }
         return "ERROR group not found or already a member/pending";
@@ -838,16 +886,15 @@ std::string handle_command(const std::string &cmd_raw, bool is_sync, std::string
         std::string group_id = tokens[1];
         std::string username = tokens[2];
         std::string request_id = tokens.size() >= 4 ? tokens[3] :
-            state.approved_request_id(group_id, username);
-        if (state.leave_group(group_id, username, request_id, command_clock(is_sync), is_sync)) {
-            state.save_to_file(state_file);
-            if (!is_sync) queue_sync("LEAVE_GROUP " + group_id + " " + username + " " + request_id);
+            target.approved_request_id(group_id, username);
+        if (target.leave_group(group_id, username, request_id, command_clock(is_sync), is_sync)) {
+            journal_command = "LEAVE_GROUP " + group_id + " " + username + " " + request_id;
             return "SUCCESS";
         }
         return "ERROR group not found or user not a member";
     }
     else if (cmd == "LIST_GROUPS") {
-        std::vector<std::string> grps = state.list_groups();
+        std::vector<std::string> grps = target.list_groups();
         std::stringstream ss;
         ss << "SUCCESS";
         for (const auto &g : grps) {
@@ -860,7 +907,7 @@ std::string handle_command(const std::string &cmd_raw, bool is_sync, std::string
         std::string group_id = tokens[1];
         std::string username = tokens[2];
         bool is_owner = false;
-        std::vector<std::string> reqs = state.list_requests(group_id, username, is_owner);
+        std::vector<std::string> reqs = target.list_requests(group_id, username, is_owner);
         if (!is_owner) {
             return "ERROR user is not the owner of this group";
         }
@@ -877,11 +924,10 @@ std::string handle_command(const std::string &cmd_raw, bool is_sync, std::string
         std::string username = tokens[2];
         std::string owner_id = tokens[3];
         std::string request_id = tokens.size() >= 5 ? tokens[4] :
-            state.pending_request_id(group_id, username);
-        if (state.accept_request(group_id, username, owner_id, request_id,
+            target.pending_request_id(group_id, username);
+        if (target.accept_request(group_id, username, owner_id, request_id,
                                  command_clock(is_sync), is_sync)) {
-            state.save_to_file(state_file);
-            if (!is_sync) queue_sync("ACCEPT_REQUEST " + group_id + " " + username + " " + owner_id + " " + request_id);
+            journal_command = "ACCEPT_REQUEST " + group_id + " " + username + " " + owner_id + " " + request_id;
             return "SUCCESS";
         }
         return "ERROR accept request failed";
@@ -898,11 +944,9 @@ std::string handle_command(const std::string &cmd_raw, bool is_sync, std::string
             piece_sha1s.push_back(tokens[i]);
         }
         if (!is_sync && local_tracker_no != 1 &&
-            !state.file_exists(group_id, file_name))
+            !target.file_exists(group_id, file_name))
             return "ERROR new filenames must be registered on tracker 1";
-        if (state.upload_file(group_id, username, file_name, file_size, file_sha1, piece_sha1s)) {
-            state.save_to_file(state_file);
-            if (!is_sync) queue_sync(cmd_str);
+        if (target.upload_file(group_id, username, file_name, file_size, file_sha1, piece_sha1s)) {
             return "SUCCESS";
         }
         return "ERROR upload failed (group, membership, or file metadata conflict)";
@@ -913,9 +957,7 @@ std::string handle_command(const std::string &cmd_raw, bool is_sync, std::string
         std::string username = tokens[2];
         std::string file_name = tokens[3];
         // A peer may advertise verified pieces before completing the file.
-        if (state.register_peer(group_id, username, file_name)) {
-            state.save_to_file(state_file);
-            if (!is_sync) queue_sync(cmd_str);
+        if (target.register_peer(group_id, username, file_name)) {
             return "SUCCESS";
         }
         return "ERROR register seeder failed";
@@ -925,7 +967,7 @@ std::string handle_command(const std::string &cmd_raw, bool is_sync, std::string
         std::string group_id = tokens[1];
         std::string username = tokens[2];
         bool is_member = false;
-        std::vector<std::string> files = state.list_files(group_id, username, is_member);
+        std::vector<std::string> files = target.list_files(group_id, username, is_member);
         if (!is_member) {
             return "ERROR user is not a member of this group";
         }
@@ -945,7 +987,7 @@ std::string handle_command(const std::string &cmd_raw, bool is_sync, std::string
         std::string file_sha1;
         std::vector<std::string> piece_sha1s;
         std::vector<std::pair<std::string, int>> peers;
-        if (state.download_file(group_id, username, file_name, file_size, file_sha1, piece_sha1s, peers)) {
+        if (target.download_file(group_id, username, file_name, file_size, file_sha1, piece_sha1s, peers)) {
             std::stringstream ss;
             ss << "SUCCESS " << file_size << " " << file_sha1;
             for (const auto &p_sha : piece_sha1s) {
@@ -961,7 +1003,7 @@ std::string handle_command(const std::string &cmd_raw, bool is_sync, std::string
     }
     else if (cmd == "VERIFY_PEER") {
         if (tokens.size() < 6) return "ERROR invalid args";
-        return state.verify_peer_access(tokens[1], tokens[2], tokens[3], tokens[4], tokens[5])
+        return target.verify_peer_access(tokens[1], tokens[2], tokens[3], tokens[4], tokens[5])
                    ? "SUCCESS" : "ERROR peer access denied";
     }
     else if (cmd == "STOP_SHARE") {
@@ -969,15 +1011,52 @@ std::string handle_command(const std::string &cmd_raw, bool is_sync, std::string
         std::string group_id = tokens[1];
         std::string username = tokens[2];
         std::string file_name = tokens[3];
-        if (state.stop_share(group_id, username, file_name)) {
-            state.save_to_file(state_file);
-            if (!is_sync) queue_sync(cmd_str);
+        if (target.stop_share(group_id, username, file_name)) {
             return "SUCCESS";
         }
         return "ERROR stop share failed";
     }
 
     return "ERROR unknown command";
+}
+
+// Validate against a private copy. A successful journal append commits the
+// operation; the snapshot may lag because startup replays its journal tail.
+std::string handle_command(const std::string &command, bool is_sync,
+                           std::string &associated_username) {
+    auto fields = Utils::split(Utils::trim(command), ' ');
+    if (fields.empty()) return "ERROR empty command";
+    const std::string &name = fields[0];
+    const bool mutation = name == "CREATE_USER" || name == "LOGIN" ||
+        name == "LOGIN_SYNC" || name == "LOGOUT" || name == "CREATE_GROUP" ||
+        name == "JOIN_GROUP" || name == "LEAVE_GROUP" || name == "ACCEPT_REQUEST" ||
+        name == "UPLOAD_FILE" || name == "REGISTER_SEEDER" || name == "STOP_SHARE";
+    std::string normalized;
+    if (!mutation)
+        return execute_command(command, is_sync, associated_username, state, normalized);
+
+    TrackerState staged;
+    {
+        std::lock_guard<std::mutex> lock(state.mtx);
+        staged.users = state.users;
+        staged.groups = state.groups;
+        staged.files = state.files;
+    }
+    std::string staged_username = associated_username;
+    std::string response = execute_command(command, is_sync, staged_username, staged, normalized);
+    if (response.rfind("SUCCESS", 0) != 0) return response;
+    JournalEntry entry{std::to_string(local_tracker_no) + ":" +
+                       std::to_string(next_operation + 1), command_clock(false), normalized};
+    if (!record_operation(entry)) return "ERROR tracker journal write failed";
+    {
+        std::lock_guard<std::mutex> lock(state.mtx);
+        state.users = std::move(staged.users);
+        state.groups = std::move(staged.groups);
+        state.files = std::move(staged.files);
+    }
+    associated_username = std::move(staged_username);
+    state.save_to_file(state_file, journal.size());
+    return response;
 }
 
 // Index of the username supplied by a client command. A zero index means
@@ -1121,16 +1200,36 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // Restore the last complete snapshot. The journal can reconstruct it if missing.
-    const bool have_snapshot = std::ifstream(state_file).good();
+    // Legacy snapshots have no watermark and already include their journal.
+    std::ifstream snapshot_stream(state_file);
+    const bool have_snapshot = snapshot_stream.good();
+    size_t snapshot_count = 0;
+    bool has_watermark = false;
+    std::string header;
+    if (std::getline(snapshot_stream, header) && header.rfind("JOURNAL_COUNT ", 0) == 0) {
+        try {
+            snapshot_count = std::stoull(header.substr(14));
+            has_watermark = true;
+        } catch (const std::exception &) { }
+    }
     state.load_from_file(state_file);
     load_journal();
-    if (!have_snapshot) {
-        for (const auto &entry : journal) {
-            std::string ignored;
-            incoming_clock = entry.clock;
-            handle_command(entry.command, true, ignored);
+    if (!have_snapshot || has_watermark) {
+        if (snapshot_count > journal.size()) {
+            std::cerr << "Snapshot is ahead of tracker journal" << std::endl;
+            return 1;
         }
+        for (size_t index = snapshot_count; index < journal.size(); ++index) {
+            const auto &entry = journal[index];
+            std::string ignored;
+            std::string normalized;
+            incoming_clock = entry.clock;
+            if (execute_command(entry.command, true, ignored, state, normalized).rfind("SUCCESS", 0) != 0) {
+                std::cerr << "Failed to replay tracker operation " << entry.id << std::endl;
+                return 1;
+            }
+        }
+        if (snapshot_count < journal.size()) state.save_to_file(state_file, journal.size());
     }
 
     // Start synchronization worker thread

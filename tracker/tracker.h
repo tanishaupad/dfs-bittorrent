@@ -88,7 +88,7 @@ public:
 
     void serialize(std::ostream &os);
     void deserialize(const std::string &data);
-    void save_to_file(const std::string &filepath);
+    void save_to_file(const std::string &filepath, size_t journal_count);
     void load_from_file(const std::string &filepath);
 };
 
