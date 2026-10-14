@@ -11,6 +11,7 @@
 struct User {
     std::string username;
     std::string password_hash;
+    std::string session_token;
     bool is_logged_in = false;
     std::string client_ip;
     int client_port = 0;
@@ -40,9 +41,13 @@ public:
     std::unordered_map<std::string, SharedFile> files; // key: group_id + ":" + file_name
 
     bool create_user(const std::string &username, const std::string &password_hash);
-    bool login(const std::string &username, const std::string &password_hash, const std::string &ip, int port);
-    void login_sync(const std::string &username, const std::string &ip, int port);
+    bool login(const std::string &username, const std::string &password_hash, const std::string &ip, int port, const std::string &token);
+    bool login_sync(const std::string &username, const std::string &ip, int port, const std::string &token);
     bool logout(const std::string &username);
+    std::string authenticated_user(const std::string &token);
+    bool verify_peer_access(const std::string &group_id, const std::string &file_name,
+                            const std::string &requester, const std::string &request_token,
+                            const std::string &seeder);
     bool create_group(const std::string &group_id, const std::string &owner_id);
     bool join_group(const std::string &group_id, const std::string &username);
     bool leave_group(const std::string &group_id, const std::string &username);

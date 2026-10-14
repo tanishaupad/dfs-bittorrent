@@ -18,6 +18,9 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 // Global state and a durable anti-entropy journal. All command application is
 // serialized by operation_mtx so snapshots and journal entries have one order.
@@ -29,10 +32,38 @@ std::set<std::string> seen_operations;
 std::atomic<bool> running{true};
 std::string journal_file;
 std::string state_file;
+std::string sync_secret;
 int local_tracker_no = 0;
 uint64_t next_operation = 0;
 
 std::string handle_command(const std::string &, bool, std::string &);
+
+std::string new_session_token() {
+    char bytes[32];
+    std::ifstream source("/dev/urandom", std::ios::binary);
+    if (!source.read(bytes, sizeof(bytes))) return "";
+    return SHA1::hash_string(std::string(bytes, sizeof(bytes)));
+}
+
+std::string load_sync_secret() {
+    const char *configured = std::getenv("DFS_TRACKER_SECRET");
+    if (configured && *configured) return configured;
+    const std::string path = "tracker_sync.key";
+    int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd >= 0) {
+        std::string generated = new_session_token();
+        if (!generated.empty()) write(fd, generated.data(), generated.size());
+        close(fd);
+    }
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        std::ifstream file(path);
+        std::string value;
+        file >> value;
+        if (value.size() == 40) return value;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    return "";
+}
 
 bool append_journal(const std::string &id, const std::string &cmd) {
     std::ofstream file(journal_file, std::ios::app);
@@ -99,6 +130,8 @@ void sync_worker(std::string other_ip, int other_port) {
             address.sin_port = htons(other_port);
             if (inet_pton(AF_INET, other_ip.c_str(), &address.sin_addr) == 1 &&
                 connect(sock, reinterpret_cast<sockaddr *>(&address), sizeof(address)) == 0 &&
+                Utils::send_msg(sock, "SYNC_HELLO " + sync_secret) &&
+                Utils::recv_msg(sock) == "SYNC_OK" &&
                 Utils::send_msg(sock, "SYNC_PULL")) {
                 while (running) {
                     std::string response = Utils::recv_msg(sock);
@@ -140,7 +173,7 @@ bool TrackerState::create_user(const std::string &username, const std::string &p
     return true;
 }
 
-bool TrackerState::login(const std::string &username, const std::string &password_hash, const std::string &ip, int port) {
+bool TrackerState::login(const std::string &username, const std::string &password_hash, const std::string &ip, int port, const std::string &token) {
     std::lock_guard<std::mutex> lock(mtx);
     auto it = users.find(username);
     if (it == users.end()) {
@@ -150,19 +183,23 @@ bool TrackerState::login(const std::string &username, const std::string &passwor
         return false;
     }
     it->second.is_logged_in = true;
+    it->second.session_token = token;
     it->second.client_ip = ip;
     it->second.client_port = port;
     return true;
 }
 
-void TrackerState::login_sync(const std::string &username, const std::string &ip, int port) {
+bool TrackerState::login_sync(const std::string &username, const std::string &ip, int port, const std::string &token) {
     std::lock_guard<std::mutex> lock(mtx);
     auto it = users.find(username);
     if (it != users.end()) {
         it->second.is_logged_in = true;
+        it->second.session_token = token;
         it->second.client_ip = ip;
         it->second.client_port = port;
+        return true;
     }
+    return false;
 }
 
 bool TrackerState::logout(const std::string &username) {
@@ -172,9 +209,32 @@ bool TrackerState::logout(const std::string &username) {
         return false;
     }
     it->second.is_logged_in = false;
+    it->second.session_token.clear();
     it->second.client_ip = "";
     it->second.client_port = 0;
     return true;
+}
+
+std::string TrackerState::authenticated_user(const std::string &token) {
+    std::lock_guard<std::mutex> lock(mtx);
+    if (token.empty()) return "";
+    for (const auto &entry : users)
+        if (entry.second.is_logged_in && entry.second.session_token == token)
+            return entry.first;
+    return "";
+}
+
+bool TrackerState::verify_peer_access(const std::string &group_id, const std::string &file_name,
+                                      const std::string &requester, const std::string &request_token,
+                                      const std::string &seeder) {
+    std::lock_guard<std::mutex> lock(mtx);
+    auto group = groups.find(group_id);
+    auto file = files.find(group_id + ":" + file_name);
+    auto user = users.find(requester);
+    if (group == groups.end() || file == files.end() || user == users.end()) return false;
+    return user->second.is_logged_in && user->second.session_token == request_token &&
+           group->second.members.count(requester) && group->second.members.count(seeder) &&
+           file->second.seeders.count(seeder);
 }
 
 bool TrackerState::create_group(const std::string &group_id, const std::string &owner_id) {
@@ -368,7 +428,8 @@ void TrackerState::serialize(std::ostream &os) {
         os << "USER " << pair.second.username << " " << pair.second.password_hash << " "
            << (pair.second.is_logged_in ? "1" : "0") << " "
            << (pair.second.client_ip.empty() ? "-" : pair.second.client_ip)
-           << " " << pair.second.client_port << "\n";
+           << " " << pair.second.client_port << " "
+           << (pair.second.session_token.empty() ? "-" : pair.second.session_token) << "\n";
     }
     for (const auto &pair : groups) {
         os << "GROUP " << pair.second.group_id << " " << pair.second.owner_id << "\n";
@@ -414,6 +475,7 @@ void TrackerState::deserialize(const std::string &data) {
                 u.is_logged_in = (tokens[3] == "1");
                 u.client_ip = tokens[4] == "-" ? "" : tokens[4];
                 u.client_port = std::stoi(tokens[5]);
+                if (tokens.size() >= 7 && tokens[6] != "-") u.session_token = tokens[6];
                 users[u.username] = u;
             }
         } else if (type == "GROUP") {
@@ -502,29 +564,30 @@ std::string handle_command(const std::string &cmd_raw, bool is_sync, std::string
         return "ERROR user already exists";
     }
     else if (cmd == "LOGIN") {
-        if (is_sync) {
-            if (tokens.size() < 4) return "ERROR invalid args";
-            std::string username = tokens[1];
-            std::string ip = tokens[2];
-            int port = std::stoi(tokens[3]);
-            state.login_sync(username, ip, port);
-            state.save_to_file(state_file);
-            return "SUCCESS";
-        } else {
+        if (!is_sync) {
             if (tokens.size() < 5) return "ERROR invalid args";
             std::string username = tokens[1];
             std::string pwd_hash = tokens[2];
             std::string ip = tokens[3];
             int port = std::stoi(tokens[4]);
-            if (state.login(username, pwd_hash, ip, port)) {
+            std::string token = new_session_token();
+            if (token.empty()) return "ERROR unable to create session";
+            if (state.login(username, pwd_hash, ip, port, token)) {
                 associated_username = username;
                 state.save_to_file(state_file);
-                // Propagate login so other tracker knows seeder IP/Port
-                queue_sync("LOGIN " + username + " " + ip + " " + std::to_string(port));
-                return "SUCCESS";
+                queue_sync("LOGIN_SYNC " + username + " " + ip + " " + std::to_string(port) + " " + token);
+                return "SUCCESS " + token;
             }
             return "ERROR invalid credentials or user does not exist";
         }
+        return "ERROR invalid sync login";
+    }
+    else if (cmd == "LOGIN_SYNC" && is_sync) {
+        if (tokens.size() < 5) return "ERROR invalid args";
+        if (!state.login_sync(tokens[1], tokens[2], std::stoi(tokens[3]), tokens[4]))
+            return "ERROR user missing during login sync";
+        state.save_to_file(state_file);
+        return "SUCCESS";
     }
     else if (cmd == "LOGOUT") {
         if (tokens.size() < 2) return "ERROR invalid args";
@@ -677,6 +740,11 @@ std::string handle_command(const std::string &cmd_raw, bool is_sync, std::string
         }
         return "ERROR download request failed (group/file not found or user not in group)";
     }
+    else if (cmd == "VERIFY_PEER") {
+        if (tokens.size() < 6) return "ERROR invalid args";
+        return state.verify_peer_access(tokens[1], tokens[2], tokens[3], tokens[4], tokens[5])
+                   ? "SUCCESS" : "ERROR peer access denied";
+    }
     else if (cmd == "STOP_SHARE") {
         if (tokens.size() < 4) return "ERROR invalid args";
         std::string group_id = tokens[1];
@@ -693,8 +761,25 @@ std::string handle_command(const std::string &cmd_raw, bool is_sync, std::string
     return "ERROR unknown command";
 }
 
+// Index of the username supplied by a client command. A zero index means
+// that any authenticated user may issue the command.
+size_t actor_index(const std::string &command) {
+    auto fields = Utils::split(command, ' ');
+    if (fields.empty()) return SIZE_MAX;
+    const std::string &name = fields[0];
+    if (name == "LIST_GROUPS") return 0;
+    if (name == "LOGOUT") return 1;
+    if (name == "CREATE_GROUP" || name == "JOIN_GROUP" || name == "LEAVE_GROUP" ||
+        name == "LIST_REQUESTS" || name == "UPLOAD_FILE" || name == "REGISTER_SEEDER" ||
+        name == "LIST_FILES" || name == "DOWNLOAD_FILE" || name == "STOP_SHARE") return 2;
+    if (name == "ACCEPT_REQUEST") return 3;
+    if (name == "VERIFY_PEER") return 5;
+    return SIZE_MAX;
+}
+
 void client_handler(int client_fd) {
     std::string associated_username = "";
+    bool sync_authenticated = false;
     while (running) {
         std::string request = Utils::recv_msg(client_fd);
         if (request.empty()) {
@@ -702,7 +787,17 @@ void client_handler(int client_fd) {
         }
 
         request = Utils::trim(request);
+        if (request.rfind("SYNC_HELLO ", 0) == 0) {
+            sync_authenticated = !sync_secret.empty() && request.substr(11) == sync_secret;
+            Utils::send_msg(client_fd, sync_authenticated ? "SYNC_OK" : "ERROR sync authentication failed");
+            if (!sync_authenticated) break;
+            continue;
+        }
         if (request.rfind("SYNC_OP ", 0) == 0) {
+            if (!sync_authenticated) {
+                Utils::send_msg(client_fd, "ERROR sync authentication required");
+                break;
+            }
             size_t separator = request.find(' ', 8);
             if (separator == std::string::npos) {
                 Utils::send_msg(client_fd, "SYNC_NACK");
@@ -714,6 +809,10 @@ void client_handler(int client_fd) {
             Utils::send_msg(client_fd, (applied ? "SYNC_ACK " : "SYNC_NACK ") + id);
         }
         else if (request == "SYNC_PULL") {
+            if (!sync_authenticated) {
+                Utils::send_msg(client_fd, "ERROR sync authentication required");
+                break;
+            }
             std::vector<std::pair<std::string, std::string>> snapshot;
             {
                 std::lock_guard<std::mutex> lock(journal_mtx);
@@ -727,7 +826,29 @@ void client_handler(int client_fd) {
         }
         else {
             std::lock_guard<std::mutex> lock(operation_mtx);
-            std::string response = handle_command(request, false, associated_username);
+            std::string response;
+            if (request.rfind("AUTH ", 0) == 0) {
+                size_t separator = request.find(' ', 5);
+                if (separator == std::string::npos) {
+                    response = "ERROR unauthenticated";
+                } else {
+                    std::string token = request.substr(5, separator - 5);
+                    std::string command = request.substr(separator + 1);
+                    std::string user = state.authenticated_user(token);
+                    size_t index = actor_index(command);
+                    auto fields = Utils::split(command, ' ');
+                    if (user.empty() || index == SIZE_MAX ||
+                        (index > 0 && (fields.size() <= index || fields[index] != user)))
+                        response = "ERROR unauthenticated";
+                    else
+                        response = handle_command(command, false, associated_username);
+                }
+            } else if (request.rfind("CREATE_USER ", 0) == 0 ||
+                       request.rfind("LOGIN ", 0) == 0) {
+                response = handle_command(request, false, associated_username);
+            } else {
+                response = "ERROR unauthenticated";
+            }
             Utils::send_msg(client_fd, response);
         }
     }
@@ -777,6 +898,11 @@ int main(int argc, char *argv[]) {
     state_file = "tracker" + std::to_string(tracker_no) + "_state.txt";
     journal_file = "tracker" + std::to_string(tracker_no) + "_journal.txt";
     local_tracker_no = tracker_no;
+    sync_secret = load_sync_secret();
+    if (sync_secret.empty()) {
+        std::cerr << "Could not load tracker synchronization secret" << std::endl;
+        return 1;
+    }
 
     // Restore the last complete snapshot. The journal can reconstruct it if missing.
     const bool have_snapshot = std::ifstream(state_file).good();

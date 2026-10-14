@@ -27,8 +27,10 @@ def line(sock):
     return data[:-1].decode()
 
 
-def command(port, request):
+def command(port, request, token=None):
     with socket.create_connection(("127.0.0.1", port), timeout=3) as sock:
+        if token:
+            request = f"AUTH {token} {request}"
         sock.sendall((request + "\n").encode())
         return line(sock)
 
@@ -69,6 +71,8 @@ class PeerHandler(socketserver.BaseRequestHandler):
         try:
             while True:
                 fields = line(self.request).split()
+                if len(fields) >= 4 and fields[0] == "AUTH":
+                    fields = fields[3:]
                 if len(fields) == 3 and fields[0] == "GET_BITFIELD":
                     pieces = self.server.files.get(fields[2])
                     bits = "1" * len(pieces)
@@ -119,26 +123,28 @@ def run_case(name, files, peers, concurrent=False):
 
             def ready():
                 try:
-                    return command(tracker_port, "LIST_GROUPS").startswith("SUCCESS")
+                    with socket.create_connection(("127.0.0.1", tracker_port), timeout=1):
+                        return True
                 except OSError:
                     return False
 
             wait_for(ready)
             pwd = hashlib.sha1(b"secret").hexdigest()
+            tokens = {}
             for username, peer in peers:
                 assert command(tracker_port, f"CREATE_USER {username} {pwd}") == "SUCCESS"
-                assert command(tracker_port, f"LOGIN {username} {pwd} 127.0.0.1 {peer.server_address[1]}") == "SUCCESS"
-            assert command(tracker_port, "CREATE_GROUP group a_good") == "SUCCESS"
+                tokens[username] = command(tracker_port, f"LOGIN {username} {pwd} 127.0.0.1 {peer.server_address[1]}").split()[1]
+            assert command(tracker_port, "CREATE_GROUP group a_good", tokens["a_good"]) == "SUCCESS"
             for username, _ in peers:
                 if username != "a_good":
-                    assert command(tracker_port, f"JOIN_GROUP group {username}") == "SUCCESS"
-                    assert command(tracker_port, f"ACCEPT_REQUEST group {username} a_good") == "SUCCESS"
+                    assert command(tracker_port, f"JOIN_GROUP group {username}", tokens[username]) == "SUCCESS"
+                    assert command(tracker_port, f"ACCEPT_REQUEST group {username} a_good", tokens["a_good"]) == "SUCCESS"
             for filename, data in files.items():
                 pieces = split_file(data)
                 hashes = " ".join(hashlib.sha1(p).hexdigest() for p in pieces)
                 full = hashlib.sha1(data).hexdigest()
                 for username, _ in peers:
-                    assert command(tracker_port, f"UPLOAD_FILE group {username} {filename} {len(data)} {full} {hashes}") == "SUCCESS"
+                    assert command(tracker_port, f"UPLOAD_FILE group {username} {filename} {len(data)} {full} {hashes}", tokens[username]) == "SUCCESS"
 
             client_port = socket.socket()
             client_port.bind(("127.0.0.1", 0))
@@ -150,8 +156,8 @@ def run_case(name, files, peers, concurrent=False):
                                       stderr=subprocess.PIPE, text=True)
             client.stdin.write("login leecher secret\njoin group group\n")
             client.stdin.flush()
-            wait_for(lambda: "leecher" in command(tracker_port, "LIST_REQUESTS group a_good"))
-            assert command(tracker_port, "ACCEPT_REQUEST group leecher a_good") == "SUCCESS"
+            wait_for(lambda: "leecher" in command(tracker_port, "LIST_REQUESTS group a_good", tokens["a_good"]))
+            assert command(tracker_port, "ACCEPT_REQUEST group leecher a_good", tokens["a_good"]) == "SUCCESS"
             for filename in files:
                 client.stdin.write(f"download file group {filename} {work / ('received-' + filename)}\n")
             client.stdin.flush()

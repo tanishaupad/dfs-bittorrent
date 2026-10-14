@@ -21,8 +21,10 @@ def free_port():
         return sock.getsockname()[1]
 
 
-def command(port, message):
+def command(port, message, token=None):
     with socket.create_connection(("127.0.0.1", port), timeout=3) as sock:
+        if token:
+            message = f"AUTH {token} {message}"
         sock.sendall((message + "\n").encode())
         data = bytearray()
         while not data.endswith(b"\n"):
@@ -64,8 +66,9 @@ def stop(process):
 def create_group(port, user, group):
     password = hashlib.sha1(b"secret").hexdigest()
     assert command(port, f"CREATE_USER {user} {password}") == "SUCCESS"
-    assert command(port, f"LOGIN {user} {password} 127.0.0.1 9999") == "SUCCESS"
-    assert command(port, f"CREATE_GROUP {group} {user}") == "SUCCESS"
+    token = command(port, f"LOGIN {user} {password} 127.0.0.1 9999").split()[1]
+    assert command(port, f"CREATE_GROUP {group} {user}", token) == "SUCCESS"
+    return token
 
 
 def main():
@@ -82,12 +85,14 @@ def main():
             t1 = start_tracker(1, broken1, work)
             t2 = start_tracker(2, broken2, work)
             processes.extend((t1, t2))
-            wait_for(lambda: command(p1, "LIST_GROUPS").startswith("SUCCESS") and
-                     command(p2, "LIST_GROUPS").startswith("SUCCESS"))
-            create_group(p1, "alice", "alpha")
-            create_group(p2, "bob", "beta")
-            assert "beta" not in command(p1, "LIST_GROUPS")
-            assert "alpha" not in command(p2, "LIST_GROUPS")
+            def ready(port):
+                with socket.create_connection(("127.0.0.1", port), timeout=1):
+                    return True
+            wait_for(lambda: ready(p1) and ready(p2))
+            alice = create_group(p1, "alice", "alpha")
+            bob = create_group(p2, "bob", "beta")
+            assert "beta" not in command(p1, "LIST_GROUPS", alice)
+            assert "alpha" not in command(p2, "LIST_GROUPS", bob)
             stop(t1)
             stop(t2)
             processes.clear()
@@ -95,8 +100,9 @@ def main():
             t1 = start_tracker(1, healed, work)
             t2 = start_tracker(2, healed, work)
             processes.extend((t1, t2))
-            wait_for(lambda: all(group in command(port, "LIST_GROUPS")
-                                 for port in (p1, p2) for group in ("alpha", "beta")))
+            wait_for(lambda: all(group in command(port, "LIST_GROUPS", token)
+                                 for port, token in ((p1, alice), (p2, bob))
+                                 for group in ("alpha", "beta")))
 
             stop(t1)
             processes.remove(t1)
@@ -104,9 +110,9 @@ def main():
             create_group(p2, "charlie", "gamma")
             t1 = start_tracker(1, healed, work)
             processes.append(t1)
-            wait_for(lambda: "gamma" in command(p1, "LIST_GROUPS"))
-            assert command(p1, "LIST_GROUPS") == command(p2, "LIST_GROUPS") or \
-                   set(command(p1, "LIST_GROUPS").split()) == set(command(p2, "LIST_GROUPS").split())
+            wait_for(lambda: "gamma" in command(p1, "LIST_GROUPS", alice))
+            assert set(command(p1, "LIST_GROUPS", alice).split()) == \
+                   set(command(p2, "LIST_GROUPS", bob).split())
             print("PASS: partition edits converged and restarted tracker caught up")
         finally:
             for process in processes:

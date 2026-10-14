@@ -6,6 +6,7 @@ tracker*_state.txt
 tracker*_pending_sync.txt
 tracker*_journal.txt
 tracker*_state.txt.tmp
+tracker_sync.key
 dummy_large.bin
 dummy_downloaded*.bin
 __pycache__/

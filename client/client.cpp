@@ -233,6 +233,8 @@ bool Client::connect_to_tracker(int &sock) {
 }
 
 std::string Client::send_to_tracker(const std::string &cmd) {
+    std::lock_guard<std::mutex> lock(tracker_mtx);
+    const bool public_command = cmd.rfind("CREATE_USER ", 0) == 0 || cmd.rfind("LOGIN ", 0) == 0;
     int sock = -1;
     bool connected = connect_to_tracker(sock);
 
@@ -251,10 +253,12 @@ std::string Client::send_to_tracker(const std::string &cmd) {
             std::string login_cmd = "LOGIN " + username + " " + pwd_hash + " " + my_ip + " " + std::to_string(my_port);
             if (Utils::send_msg(sock, login_cmd)) {
                 std::string res = Utils::recv_msg(sock);
-                if (res.rfind("SUCCESS", 0) != 0) {
+                auto fields = Utils::split(res, ' ');
+                if (fields.size() != 2 || fields[0] != "SUCCESS") {
                     close(sock);
                     return "ERROR session recovery failed on backup tracker: " + res;
                 }
+                session_token = fields[1];
             } else {
                 close(sock);
                 return "ERROR connection to backup tracker lost during recovery";
@@ -262,14 +266,60 @@ std::string Client::send_to_tracker(const std::string &cmd) {
         }
     }
 
-    if (!Utils::send_msg(sock, cmd)) {
+    std::string request = public_command ? cmd : "AUTH " + session_token + " " + cmd;
+    if (!public_command && session_token.empty()) {
+        close(sock);
+        return "ERROR unauthenticated";
+    }
+    if (!Utils::send_msg(sock, request)) {
         close(sock);
         return "ERROR sending command to tracker failed";
     }
 
     std::string response = Utils::recv_msg(sock);
+    if (response == "ERROR unauthenticated" && !public_command && logged_in &&
+        !username.empty() && !password.empty()) {
+        std::string login_cmd = "LOGIN " + username + " " + SHA1::hash_string(password) +
+                                " " + my_ip + " " + std::to_string(my_port);
+        if (Utils::send_msg(sock, login_cmd)) {
+            auto fields = Utils::split(Utils::recv_msg(sock), ' ');
+            if (fields.size() == 2 && fields[0] == "SUCCESS") {
+                session_token = fields[1];
+                if (Utils::send_msg(sock, "AUTH " + session_token + " " + cmd))
+                    response = Utils::recv_msg(sock);
+            }
+        }
+    }
     close(sock);
     return response;
+}
+
+std::string Client::peer_auth_prefix() {
+    std::lock_guard<std::mutex> lock(tracker_mtx);
+    if (!logged_in || username.empty() || session_token.empty()) return "";
+    return "AUTH " + username + " " + session_token + " ";
+}
+
+std::string Client::current_username() {
+    std::lock_guard<std::mutex> lock(tracker_mtx);
+    return logged_in ? username : "";
+}
+
+void Client::set_login_session(const std::string &user, const std::string &pwd,
+                               const std::string &token) {
+    std::lock_guard<std::mutex> lock(tracker_mtx);
+    username = user;
+    password = pwd;
+    session_token = token;
+    logged_in = true;
+}
+
+void Client::clear_login_session() {
+    std::lock_guard<std::mutex> lock(tracker_mtx);
+    logged_in = false;
+    username.clear();
+    password.clear();
+    session_token.clear();
 }
 
 // C2C Connection Handler
@@ -280,6 +330,24 @@ void peer_connection_handler(int sock, Client *cl) {
 
         std::vector<std::string> tokens = Utils::split(msg, ' ');
         if (tokens.empty()) continue;
+        if (!cl->logged_in || tokens.size() < 6 || tokens[0] != "AUTH") {
+            Utils::send_msg(sock, "ERROR unauthorized peer request");
+            continue;
+        }
+        std::string requester = tokens[1];
+        std::string requester_token = tokens[2];
+        tokens.erase(tokens.begin(), tokens.begin() + 3);
+        if (tokens.size() < 3) {
+            Utils::send_msg(sock, "ERROR invalid args");
+            continue;
+        }
+        std::string seeder = cl->current_username();
+        std::string verification = "VERIFY_PEER " + tokens[1] + " " + tokens[2] + " " +
+                                   requester + " " + requester_token + " " + seeder;
+        if (seeder.empty() || cl->send_to_tracker(verification) != "SUCCESS") {
+            Utils::send_msg(sock, "ERROR peer access denied");
+            continue;
+        }
 
         if (tokens[0] == "GET_BITFIELD") {
             if (tokens.size() < 3) {
@@ -304,7 +372,8 @@ void peer_connection_handler(int sock, Client *cl) {
                 std::string bitfield(pieces, '1'); // default is completed
                 if (it != cl->downloads.end()) {
                     for (size_t i = 0; i < pieces; i++) {
-                        bitfield[i] = (it->second.pieces_status[i] ? '1' : '0');
+                        bitfield[i] = (i < it->second.pieces_status.size() &&
+                                       it->second.pieces_status[i] ? '1' : '0');
                       }
                 }
                 Utils::send_msg(sock, "BITFIELD " + bitfield);
@@ -319,7 +388,12 @@ void peer_connection_handler(int sock, Client *cl) {
             }
             std::string g_id = tokens[1];
             std::string f_name = tokens[2];
-            size_t piece_idx = std::stoull(tokens[3]);
+            size_t piece_idx = 0;
+            try { piece_idx = std::stoull(tokens[3]); }
+            catch (const std::exception &) {
+                Utils::send_msg(sock, "ERROR invalid piece index");
+                continue;
+            }
             std::string filepath;
             if (cl->get_shared_file(g_id, f_name, filepath)) {
                 std::string key = g_id + ":" + f_name;
@@ -342,6 +416,13 @@ void peer_connection_handler(int sock, Client *cl) {
                 std::ifstream file(filepath, std::ios::binary);
                 if (!file.is_open()) {
                     Utils::send_msg(sock, "ERROR file error");
+                    continue;
+                }
+
+                file.seekg(0, std::ios::end);
+                const std::streamoff size = file.tellg();
+                if (size <= 0 || piece_idx >= (static_cast<size_t>(size) + 524287) / 524288) {
+                    Utils::send_msg(sock, "ERROR invalid piece index");
                     continue;
                 }
 
@@ -371,6 +452,9 @@ void peer_server(int server_fd, Client *cl) {
     while (true) {
         int client_fd = accept(server_fd, nullptr, nullptr);
         if (client_fd >= 0) {
+            struct timeval timeout{10, 0};
+            setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+            setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
             std::thread t(peer_connection_handler, client_fd, cl);
             t.detach();
         }
@@ -383,7 +467,7 @@ void peer_download_worker(size_t peer_index, int sock, std::string peer_bitfield
     static std::mutex file_write_mtx;
 
     while (queue->pop_piece(peer_index, peer_bitfield, piece_idx)) {
-        std::string req = "GET_PIECE " + group_id + " " + file_name + " " + std::to_string(piece_idx);
+        std::string req = cl->peer_auth_prefix() + "GET_PIECE " + group_id + " " + file_name + " " + std::to_string(piece_idx);
         if (!Utils::send_msg(sock, req)) {
             queue->retry(peer_index, piece_idx, false);
             break;
@@ -500,7 +584,7 @@ void download_coordinator_thread(std::string group_id, std::string file_name, st
         }
 
         // Request bitfield
-        std::string req = "GET_BITFIELD " + group_id + " " + file_name;
+        std::string req = cl->peer_auth_prefix() + "GET_BITFIELD " + group_id + " " + file_name;
         if (!Utils::send_msg(sock, req)) {
             close(sock);
             continue;
@@ -611,12 +695,11 @@ void run_cli(Client *cl) {
 
             std::string cmd = "LOGIN " + uid + " " + pwd_hash + " " + cl->my_ip + " " + std::to_string(cl->my_port);
             std::string res = cl->send_to_tracker(cmd);
-            std::cout << res << std::endl;
-            if (res.rfind("SUCCESS", 0) == 0) {
-                cl->logged_in = true;
-                cl->username = uid;
-                cl->password = pwd;
-            }
+            auto response = Utils::split(res, ' ');
+            if (response.size() == 2 && response[0] == "SUCCESS") {
+                cl->set_login_session(uid, pwd, response[1]);
+                std::cout << "SUCCESS" << std::endl;
+            } else std::cout << res << std::endl;
         }
         else if (tokens.size() >= 3 && tokens[0] == "create" && tokens[1] == "group") {
             if (!cl->logged_in) {
@@ -686,9 +769,7 @@ void run_cli(Client *cl) {
             std::string cmd = "LOGOUT " + cl->username;
             std::string res = cl->send_to_tracker(cmd);
             std::cout << res << std::endl;
-            cl->logged_in = false;
-            cl->username = "";
-            cl->password = "";
+            cl->clear_login_session();
         }
         else if (tokens.size() >= 4 && tokens[0] == "upload" && tokens[1] == "file") {
             if (!cl->logged_in) {

@@ -72,6 +72,7 @@ Start both trackers using the following command format:
 ./tracker/tracker tracker_info.txt 2
 ```
 To shutdown a tracker server gracefully, enter `quit` in the tracker console.
+Trackers started from the same run directory create a private `tracker_sync.key` file for authenticating journal exchange. For trackers on different machines, set the same `DFS_TRACKER_SECRET` environment variable on both before starting them. Keep that secret and the tracker state files private.
 
 ### 3. Start Client Applications
 Start the clients using the following command format:
@@ -116,6 +117,7 @@ Once a client starts, it presents an interactive prompt `>` accepting the follow
 4. **Sharing During Downloads**: Once a piece passes its SHA-1 check and is written to disk, the downloader registers with the tracker. Other clients can discover it, query its current bitfield, and request verified pieces before the full file completes. The partial file is added to the persistent local sharing database only after the whole-file check succeeds.
 5. **Tracker Operation Journals**: Each tracker retains accepted state changes with unique operation IDs. The trackers exchange journal entries repeatedly and apply unseen operations after a restart or temporary separation. State snapshots are replaced atomically, and a missing snapshot can be rebuilt from the journal.
 6. **Transparent Failover**: Client detects primary tracker disconnects, automatically redirects commands to the backup tracker, and transparently recovers the user session in the background.
+7. **Access Checks**: Login returns a session token. Tracker commands carry the token and must name its owner. Before serving a piece or bitfield, a peer asks the tracker to validate the requester's token and group membership. Logout invalidates the token.
 
 Peer availability is sampled when each download starts. A running download does not yet refresh its peer list or bitfields, so it may need a retry to use pieces that another peer acquires later.
 

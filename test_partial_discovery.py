@@ -35,8 +35,10 @@ def read_line(sock):
     return result[:-1].decode()
 
 
-def command(port, message):
+def command(port, message, token=None):
     with socket.create_connection(("127.0.0.1", port), timeout=3) as sock:
+        if token:
+            message = f"AUTH {token} {message}"
         sock.sendall((message + "\n").encode())
         return read_line(sock)
 
@@ -57,10 +59,10 @@ def fake_seed(listener, release, errors):
             connection, _ = listener.accept()
             with connection:
                 connection.settimeout(25)
-                assert read_line(connection) == "GET_BITFIELD group sample.bin"
+                assert read_line(connection).split()[3:] == ["GET_BITFIELD", "group", "sample.bin"]
                 connection.sendall(b"BITFIELD 111\n")
                 for index in range(len(PIECES)):
-                    assert read_line(connection) == f"GET_PIECE group sample.bin {index}"
+                    assert read_line(connection).split()[3:] == ["GET_PIECE", "group", "sample.bin", str(index)]
                     if index > 0 and not release.wait(20):
                         raise AssertionError("test did not release the source")
                     piece = PIECES[index]
@@ -94,22 +96,29 @@ def main():
 
             def tracker_ready():
                 try:
-                    return command(tracker_port, "LIST_GROUPS").startswith("SUCCESS")
+                    with socket.create_connection(("127.0.0.1", tracker_port), timeout=1):
+                        return True
                 except OSError:
                     return False
 
             wait_until(tracker_ready)
-            for user, port in (("seed", seed_port), ("leecher", client_port)):
+            tokens = {}
+            for user, port in (("seed", seed_port), ("leecher", client_port),
+                               ("observer", 9998), ("outsider", 9997)):
                 password = hashlib.sha1(b"password").hexdigest()
                 assert command(tracker_port, f"CREATE_USER {user} {password}") == "SUCCESS"
-                assert command(tracker_port, f"LOGIN {user} {password} 127.0.0.1 {port}") == "SUCCESS"
-            assert command(tracker_port, "CREATE_GROUP group seed") == "SUCCESS"
-            assert command(tracker_port, "JOIN_GROUP group leecher") == "SUCCESS"
-            assert command(tracker_port, "ACCEPT_REQUEST group leecher seed") == "SUCCESS"
-            assert command(tracker_port, "REGISTER_SEEDER group leecher missing.bin").startswith("ERROR")
+                tokens[user] = command(tracker_port, f"LOGIN {user} {password} 127.0.0.1 {port}").split()[1]
+            assert command(tracker_port, "CREATE_GROUP group seed", tokens["seed"]) == "SUCCESS"
+            for user in ("leecher", "observer"):
+                assert command(tracker_port, f"JOIN_GROUP group {user}", tokens[user]) == "SUCCESS"
+                assert command(tracker_port, f"ACCEPT_REQUEST group {user} seed", tokens["seed"]) == "SUCCESS"
+            assert command(tracker_port, "REGISTER_SEEDER group leecher missing.bin", tokens["leecher"]).startswith("ERROR")
+            assert command(tracker_port, "DOWNLOAD_FILE group observer sample.bin").startswith("ERROR unauthenticated")
+            assert command(tracker_port, "SYNC_PULL").startswith("ERROR sync authentication required")
+            assert command(tracker_port, "CREATE_GROUP stolen seed", tokens["outsider"]).startswith("ERROR unauthenticated")
             hashes = " ".join(hashlib.sha1(piece).hexdigest() for piece in PIECES)
             file_hash = hashlib.sha1(DATA).hexdigest()
-            assert command(tracker_port, f"UPLOAD_FILE group seed sample.bin {len(DATA)} {file_hash} {hashes}") == "SUCCESS"
+            assert command(tracker_port, f"UPLOAD_FILE group seed sample.bin {len(DATA)} {file_hash} {hashes}", tokens["seed"]) == "SUCCESS"
 
             client = subprocess.Popen(
                 [str(ROOT / "client/client"), f"127.0.0.1:{client_port}", str(config)],
@@ -122,20 +131,29 @@ def main():
             client.stdin.flush()
 
             def leecher_discovered():
-                reply = command(tracker_port, "DOWNLOAD_FILE group leecher sample.bin")
+                reply = command(tracker_port, "DOWNLOAD_FILE group seed sample.bin", tokens["seed"])
                 return f"127.0.0.1:{client_port}" in reply
 
             wait_until(leecher_discovered)
             with socket.create_connection(("127.0.0.1", client_port), timeout=3) as peer:
                 peer.settimeout(3)
-                peer.sendall(b"GET_BITFIELD group sample.bin\n")
+                peer.sendall(f"AUTH observer {tokens['observer']} GET_BITFIELD group sample.bin\n".encode())
                 assert read_line(peer) == "BITFIELD 100"
-                peer.sendall(b"GET_PIECE group sample.bin 0\n")
+                peer.sendall(f"AUTH observer {tokens['observer']} GET_PIECE group sample.bin 0\n".encode())
                 assert read_line(peer) == f"OK {PIECE_SIZE}"
                 received = bytearray()
                 while len(received) < PIECE_SIZE:
                     received.extend(peer.recv(PIECE_SIZE - len(received)))
                 assert bytes(received) == PIECES[0]
+                peer.sendall(f"AUTH observer {tokens['observer']} GET_PIECE group sample.bin nope\n".encode())
+                assert read_line(peer) == "ERROR invalid piece index"
+                peer.sendall(f"AUTH outsider {tokens['outsider']} GET_BITFIELD group sample.bin\n".encode())
+                assert read_line(peer).startswith("ERROR peer access denied")
+
+            assert command(tracker_port, "LOGOUT observer", tokens["observer"]) == "SUCCESS"
+            with socket.create_connection(("127.0.0.1", client_port), timeout=3) as peer:
+                peer.sendall(f"AUTH observer {tokens['observer']} GET_BITFIELD group sample.bin\n".encode())
+                assert read_line(peer).startswith("ERROR peer access denied")
 
             release.set()
             wait_until(lambda: destination.exists() and

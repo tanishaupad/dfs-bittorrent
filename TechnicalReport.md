@@ -40,13 +40,16 @@ Communication uses standard TCP sockets with custom application-layer protocols:
 
 ### A. Client-Tracker Commands
 Text-based, space-separated commands terminated by a newline (`\n`).
-- Format: `COMMAND_NAME <arg1> <arg2> ...`
+- Registration and login are public. Login returns `SUCCESS <session_token>`.
+- Other requests use `AUTH <session_token> COMMAND_NAME <arg1> <arg2> ...`. The tracker checks that the command's username matches the token owner.
 - Responses: `SUCCESS <payload>` or `ERROR <reason>`
 
 ### B. Client-Client (P2P) Chunk Transfer
 Uses a text header to communicate file offsets and data size, followed immediately by binary payload transmission to handle file formatting natively (avoiding issues with null terminators in images/binaries):
-- **Request Bitfield**: `GET_BITFIELD <group_id> <file_name>` -> Returns `BITFIELD <01_string>`
-- **Request Piece**: `GET_PIECE <group_id> <file_name> <piece_index>` -> Returns `OK <bytes_len>\n<binary_payload>`
+- **Request Bitfield**: `AUTH <user> <session_token> GET_BITFIELD <group_id> <file_name>` -> Returns `BITFIELD <01_string>` after tracker validation.
+- **Request Piece**: `AUTH <user> <session_token> GET_PIECE <group_id> <file_name> <piece_index>` -> Returns `OK <bytes_len>\n<binary_payload>` after tracker validation.
+
+Trackers authenticate journal connections with a shared secret. The same run directory uses a locally generated `tracker_sync.key`; deployments on separate machines can supply `DFS_TRACKER_SECRET`. Client and peer traffic is still plaintext TCP, so token confidentiality requires a trusted network or a future encrypted transport.
 
 ---
 

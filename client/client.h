@@ -5,6 +5,7 @@
 #include <vector>
 #include <unordered_map>
 #include <mutex>
+#include <atomic>
 
 struct DownloadProgress {
     std::string group_id;
@@ -26,7 +27,9 @@ public:
     int my_port = 0;
     std::string username = "";
     std::string password = ""; // Stores password for transparent re-logins on failover
-    bool logged_in = false;
+    std::atomic<bool> logged_in{false};
+    std::string session_token;
+    std::mutex tracker_mtx;
 
     std::vector<std::pair<std::string, int>> trackers;
     int active_tracker_idx = 0;
@@ -46,6 +49,10 @@ public:
 
     bool connect_to_tracker(int &sock);
     std::string send_to_tracker(const std::string &cmd);
+    std::string peer_auth_prefix();
+    std::string current_username();
+    void set_login_session(const std::string &user, const std::string &pwd, const std::string &token);
+    void clear_login_session();
 
     void add_shared_file(const std::string &group_id, const std::string &file_name, const std::string &filepath);
     void announce_verified_pieces(const std::string &group_id, const std::string &file_name, const std::string &filepath, const std::string &sharing_user);
