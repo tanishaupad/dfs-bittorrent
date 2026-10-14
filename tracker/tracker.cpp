@@ -27,7 +27,12 @@
 TrackerState state;
 std::mutex operation_mtx;
 std::mutex journal_mtx;
-std::vector<std::pair<std::string, std::string>> journal;
+struct JournalEntry {
+    std::string id;
+    VectorClock clock{};
+    std::string command;
+};
+std::vector<JournalEntry> journal;
 std::set<std::string> seen_operations;
 std::atomic<bool> running{true};
 std::string journal_file;
@@ -35,6 +40,57 @@ std::string state_file;
 std::string sync_secret;
 int local_tracker_no = 0;
 uint64_t next_operation = 0;
+VectorClock logical_clock{};
+VectorClock incoming_clock{}; // Accessed only while operation_mtx is held.
+
+bool causally_after(const VectorClock &later, const VectorClock &earlier) {
+    return later[0] >= earlier[0] && later[1] >= earlier[1] && later != earlier;
+}
+
+VectorClock command_clock(bool is_sync) {
+    if (is_sync) return incoming_clock;
+    VectorClock result = logical_clock;
+    ++result[local_tracker_no - 1];
+    return result;
+}
+
+VectorClock legacy_clock(const std::string &id) {
+    VectorClock clock{};
+    size_t separator = id.find(':');
+    if (separator == std::string::npos) return clock;
+    try {
+        int origin = std::stoi(id.substr(0, separator));
+        if (origin >= 1 && origin <= 2)
+            clock[origin - 1] = std::stoull(id.substr(separator + 1));
+    } catch (const std::exception &) { }
+    return clock;
+}
+
+std::string wire_operation(const JournalEntry &entry) {
+    return "SYNC_OP " + entry.id + " " + std::to_string(entry.clock[0]) + " " +
+           std::to_string(entry.clock[1]) + " " + entry.command;
+}
+
+bool parse_wire_operation(const std::string &message, JournalEntry &entry) {
+    if (message.rfind("SYNC_OP ", 0) != 0) return false;
+    size_t first = message.find(' ', 8);
+    if (first == std::string::npos) return false;
+    entry.id = message.substr(8, first - 8);
+    size_t second = message.find(' ', first + 1);
+    size_t third = second == std::string::npos ? std::string::npos : message.find(' ', second + 1);
+    if (third != std::string::npos) {
+        try {
+            entry.clock = {std::stoull(message.substr(first + 1, second - first - 1)),
+                           std::stoull(message.substr(second + 1, third - second - 1))};
+            entry.command = message.substr(third + 1);
+            return !entry.command.empty();
+        } catch (const std::exception &) { }
+    }
+    // A pre-clock peer sent only its operation ID and command.
+    entry.clock = legacy_clock(entry.id);
+    entry.command = message.substr(first + 1);
+    return !entry.command.empty();
+}
 
 std::string handle_command(const std::string &, bool, std::string &);
 
@@ -65,24 +121,26 @@ std::string load_sync_secret() {
     return "";
 }
 
-bool append_journal(const std::string &id, const std::string &cmd) {
+bool append_journal(const JournalEntry &entry) {
     std::ofstream file(journal_file, std::ios::app);
     if (!file.is_open()) return false;
-    file << id << "\t" << cmd << "\n";
+    file << entry.id << "\t" << entry.clock[0] << "\t" << entry.clock[1]
+         << "\t" << entry.command << "\n";
     file.flush();
     return file.good();
 }
 
 void queue_sync(const std::string &cmd) {
     std::lock_guard<std::mutex> lock(journal_mtx);
-    std::string id = std::to_string(local_tracker_no) + ":" +
-                     std::to_string(++next_operation);
-    if (!append_journal(id, cmd)) {
+    JournalEntry entry{std::to_string(local_tracker_no) + ":" +
+                       std::to_string(++next_operation), command_clock(false), cmd};
+    if (!append_journal(entry)) {
         std::cerr << "Failed to append tracker operation journal" << std::endl;
         return;
     }
-    seen_operations.insert(id);
-    journal.push_back({id, cmd});
+    logical_clock = entry.clock;
+    seen_operations.insert(entry.id);
+    journal.push_back(entry);
 }
 
 void load_journal() {
@@ -92,8 +150,19 @@ void load_journal() {
         size_t tab = line.find('\t');
         if (tab == std::string::npos) continue;
         std::string id = line.substr(0, tab);
-        std::string cmd = line.substr(tab + 1);
-        if (seen_operations.insert(id).second) journal.push_back({id, cmd});
+        JournalEntry entry{id, legacy_clock(id), line.substr(tab + 1)};
+        size_t second = line.find('\t', tab + 1);
+        size_t third = second == std::string::npos ? std::string::npos : line.find('\t', second + 1);
+        if (third != std::string::npos) {
+            try {
+                entry.clock = {std::stoull(line.substr(tab + 1, second - tab - 1)),
+                               std::stoull(line.substr(second + 1, third - second - 1))};
+                entry.command = line.substr(third + 1);
+            } catch (const std::exception &) { continue; }
+        }
+        if (seen_operations.insert(id).second) journal.push_back(entry);
+        for (size_t i = 0; i < 2; ++i)
+            logical_clock[i] = std::max(logical_clock[i], entry.clock[i]);
         std::string prefix = std::to_string(local_tracker_no) + ":";
         if (id.rfind(prefix, 0) == 0) {
             try { next_operation = std::max(next_operation, std::stoull(id.substr(prefix.size()))); }
@@ -102,19 +171,22 @@ void load_journal() {
     }
 }
 
-bool apply_remote_operation(const std::string &id, const std::string &cmd) {
+bool apply_remote_operation(const JournalEntry &entry) {
     std::lock_guard<std::mutex> operation_lock(operation_mtx);
     {
         std::lock_guard<std::mutex> journal_lock(journal_mtx);
-        if (seen_operations.count(id)) return true;
+        if (seen_operations.count(entry.id)) return true;
     }
+    incoming_clock = entry.clock;
     std::string ignored;
-    std::string response = handle_command(cmd, true, ignored);
+    std::string response = handle_command(entry.command, true, ignored);
     if (response.rfind("SUCCESS", 0) != 0) return false;
     std::lock_guard<std::mutex> journal_lock(journal_mtx);
-    if (!append_journal(id, cmd)) return false;
-    seen_operations.insert(id);
-    journal.push_back({id, cmd});
+    if (!append_journal(entry)) return false;
+    seen_operations.insert(entry.id);
+    journal.push_back(entry);
+    for (size_t i = 0; i < 2; ++i)
+        logical_clock[i] = std::max(logical_clock[i], entry.clock[i]);
     return true;
 }
 
@@ -137,20 +209,19 @@ void sync_worker(std::string other_ip, int other_port) {
                     std::string response = Utils::recv_msg(sock);
                     if (response == "SYNC_END" || response.empty()) break;
                     if (response.rfind("SYNC_OP ", 0) != 0) break;
-                    size_t separator = response.find(' ', 8);
-                    if (separator == std::string::npos) break;
-                    apply_remote_operation(response.substr(8, separator - 8),
-                                           response.substr(separator + 1));
+                    JournalEntry entry;
+                    if (!parse_wire_operation(response, entry)) break;
+                    apply_remote_operation(entry);
                 }
-                std::vector<std::pair<std::string, std::string>> snapshot;
+                std::vector<JournalEntry> snapshot;
                 {
                     std::lock_guard<std::mutex> lock(journal_mtx);
                     snapshot = journal;
                 }
                 for (const auto &entry : snapshot) {
-                    if (!Utils::send_msg(sock, "SYNC_OP " + entry.first + " " + entry.second)) break;
+                    if (!Utils::send_msg(sock, wire_operation(entry))) break;
                     std::string reply = Utils::recv_msg(sock);
-                    if (reply != "SYNC_ACK " + entry.first) break;
+                    if (reply != "SYNC_ACK " + entry.id) break;
                 }
             }
             close(sock);
@@ -247,32 +318,71 @@ bool TrackerState::create_group(const std::string &group_id, const std::string &
     g.owner_id = owner_id;
     g.members.insert(owner_id);
     g.approved_ids[owner_id] = "owner:" + group_id + ":" + owner_id;
+    MembershipRequest owner_request;
+    owner_request.joined = owner_request.approved = true;
+    g.membership_requests[owner_id][g.approved_ids[owner_id]] = owner_request;
     groups[group_id] = g;
     return true;
 }
 
+// Rebuild one user's visible membership from immutable request/approval/removal
+// events. An approval and its request must both causally follow every removal;
+// concurrent events therefore lose to removal in either delivery order.
+void refresh_membership(Group &group, const std::string &username) {
+    group.members.erase(username);
+    group.pending_requests.erase(username);
+    group.request_ids.erase(username);
+    group.approved_ids.erase(username);
+    auto requests = group.membership_requests.find(username);
+    if (requests == group.membership_requests.end()) return;
+    auto survives = [&](const VectorClock &clock) {
+        auto removals = group.removal_clocks.find(username);
+        if (removals == group.removal_clocks.end()) return true;
+        for (const auto &entry : removals->second)
+            if (!causally_after(clock, entry.second)) return false;
+        return true;
+    };
+    std::string pending;
+    std::string approved;
+    for (const auto &entry : requests->second) {
+        const std::string &id = entry.first;
+        const MembershipRequest &request = entry.second;
+        if (group.revoked_ids.count(id) || !request.joined ||
+            !survives(request.join_clock)) continue;
+        if (request.approved && survives(request.approval_clock)) {
+            if (approved.empty() || id < approved) approved = id;
+        } else if (!request.approved && (pending.empty() || id < pending)) {
+            pending = id;
+        }
+    }
+    if (!approved.empty()) {
+        group.members.insert(username);
+        group.approved_ids[username] = approved;
+    } else if (!pending.empty()) {
+        group.pending_requests.insert(username);
+        group.request_ids[username] = pending;
+    }
+}
+
 bool TrackerState::join_group(const std::string &group_id, const std::string &username,
-                              const std::string &request_id, bool is_sync) {
+                              const std::string &request_id, const VectorClock &clock,
+                              bool is_sync) {
     std::lock_guard<std::mutex> lock(mtx);
     auto it = groups.find(group_id);
     if (it == groups.end() || request_id.empty()) return false;
     Group &group = it->second;
-    if (group.revoked_ids.count(request_id)) return is_sync;
-    if (group.approved_ids.count(username) && group.approved_ids.at(username) == request_id) {
-        group.members.insert(username);
-        group.pending_requests.erase(username);
-        group.request_ids.erase(username);
-        return true;
-    }
-    if (group.members.count(username) || group.pending_requests.count(username))
-        return is_sync; // Duplicate or concurrent request; keep the existing request.
-    group.request_ids[username] = request_id;
-    group.pending_requests.insert(username);
+    if (!is_sync && (group.members.count(username) || group.pending_requests.count(username)))
+        return false;
+    MembershipRequest &request = group.membership_requests[username][request_id];
+    request.joined = true;
+    request.join_clock = clock;
+    refresh_membership(group, username);
     return true;
 }
 
 bool TrackerState::leave_group(const std::string &group_id, const std::string &username,
-                               const std::string &request_id, bool is_sync) {
+                               const std::string &request_id, const VectorClock &clock,
+                               bool is_sync) {
     std::lock_guard<std::mutex> lock(mtx);
     auto it = groups.find(group_id);
     if (it == groups.end()) return false;
@@ -282,14 +392,9 @@ bool TrackerState::leave_group(const std::string &group_id, const std::string &u
                      group.approved_ids.at(username) != request_id)) return false;
     if (request_id.empty()) return false;
     group.revoked_ids.insert(request_id);
-    if (group.approved_ids.count(username) && group.approved_ids.at(username) == request_id) {
-        group.members.erase(username);
-        group.approved_ids.erase(username);
-    }
-    if (group.request_ids.count(username) && group.request_ids.at(username) == request_id) {
-        group.pending_requests.erase(username);
-        group.request_ids.erase(username);
-    }
+    group.removal_clocks[username][std::to_string(clock[0]) + ":" +
+                                   std::to_string(clock[1])] = clock;
+    refresh_membership(group, username);
     return true;
 }
 
@@ -323,23 +428,18 @@ std::vector<std::string> TrackerState::list_requests(const std::string &group_id
 
 bool TrackerState::accept_request(const std::string &group_id, const std::string &username,
                                   const std::string &owner_id, const std::string &request_id,
-                                  bool is_sync) {
+                                  const VectorClock &clock, bool is_sync) {
     std::lock_guard<std::mutex> lock(mtx);
     auto it = groups.find(group_id);
     if (it == groups.end() || it->second.owner_id != owner_id || request_id.empty()) return false;
     Group &group = it->second;
-    if (group.revoked_ids.count(request_id)) return is_sync;
     if (!is_sync && (!group.pending_requests.count(username) ||
                      !group.request_ids.count(username) ||
                      group.request_ids.at(username) != request_id)) return false;
-    // An approval can arrive before its request. Retain its ID until the request
-    // arrives; a matching removal tombstone still takes precedence.
-    group.approved_ids[username] = request_id;
-    if (group.request_ids.count(username) && group.request_ids.at(username) == request_id) {
-        group.pending_requests.erase(username);
-        group.request_ids.erase(username);
-    }
-    group.members.insert(username);
+    MembershipRequest &request = group.membership_requests[username][request_id];
+    request.approved = true;
+    request.approval_clock = clock;
+    refresh_membership(group, username);
     return true;
 }
 
@@ -487,6 +587,22 @@ void TrackerState::serialize(std::ostream &os) {
             os << "APPROVED_ID " << pair.second.group_id << " " << entry.first << " " << entry.second << "\n";
         for (const auto &id : pair.second.revoked_ids)
             os << "REVOKED_ID " << pair.second.group_id << " " << id << "\n";
+        for (const auto &user : pair.second.membership_requests)
+            for (const auto &entry : user.second) {
+                const MembershipRequest &request = entry.second;
+                if (request.joined)
+                    os << "MJOIN " << pair.second.group_id << " " << user.first << " "
+                       << entry.first << " " << request.join_clock[0] << " "
+                       << request.join_clock[1] << "\n";
+                if (request.approved)
+                    os << "MAPP " << pair.second.group_id << " " << user.first << " "
+                       << entry.first << " " << request.approval_clock[0] << " "
+                       << request.approval_clock[1] << "\n";
+            }
+        for (const auto &user : pair.second.removal_clocks)
+            for (const auto &removal : user.second)
+                os << "MREM " << pair.second.group_id << " " << user.first << " "
+                   << removal.second[0] << " " << removal.second[1] << "\n";
     }
     for (const auto &pair : files) {
         os << "FILE " << pair.second.group_id << " " << pair.second.file_name << " "
@@ -551,6 +667,17 @@ void TrackerState::deserialize(const std::string &data) {
             groups[tokens[1]].approved_ids[tokens[2]] = tokens[3];
         } else if (type == "REVOKED_ID" && tokens.size() >= 3) {
             groups[tokens[1]].revoked_ids.insert(tokens[2]);
+        } else if (type == "MJOIN" && tokens.size() >= 6) {
+            auto &request = groups[tokens[1]].membership_requests[tokens[2]][tokens[3]];
+            request.joined = true;
+            request.join_clock = {std::stoull(tokens[4]), std::stoull(tokens[5])};
+        } else if (type == "MAPP" && tokens.size() >= 6) {
+            auto &request = groups[tokens[1]].membership_requests[tokens[2]][tokens[3]];
+            request.approved = true;
+            request.approval_clock = {std::stoull(tokens[4]), std::stoull(tokens[5])};
+        } else if (type == "MREM" && tokens.size() >= 5) {
+            VectorClock clock{std::stoull(tokens[3]), std::stoull(tokens[4])};
+            groups[tokens[1]].removal_clocks[tokens[2]][tokens[3] + ":" + tokens[4]] = clock;
         } else if (type == "FILE") {
             if (tokens.size() >= 5) {
                 SharedFile f;
@@ -574,16 +701,25 @@ void TrackerState::deserialize(const std::string &data) {
             }
         }
     }
-    // Old snapshots recorded membership but not request IDs.
+    // Older snapshots recorded only the visible membership. Convert that state
+    // into baseline events so the next write uses the same conflict policy.
     for (auto &entry : groups) {
         Group &group = entry.second;
-        for (const auto &user : group.members)
-            if (!group.approved_ids.count(user))
-                group.approved_ids[user] = (user == group.owner_id ? "owner:" : "legacy:") +
-                                           group.group_id + ":" + user;
-        for (const auto &user : group.pending_requests)
-            if (!group.request_ids.count(user))
-                group.request_ids[user] = "legacy:" + group.group_id + ":" + user;
+        if (group.membership_requests.empty()) {
+            for (const auto &user : group.members) {
+                std::string id = group.approved_ids.count(user) ? group.approved_ids.at(user) :
+                    (user == group.owner_id ? "owner:" : "legacy:") + group.group_id + ":" + user;
+                MembershipRequest &request = group.membership_requests[user][id];
+                request.joined = request.approved = true;
+            }
+            for (const auto &user : group.pending_requests) {
+                std::string id = group.request_ids.count(user) ? group.request_ids.at(user) :
+                    "legacy:" + group.group_id + ":" + user;
+                group.membership_requests[user][id].joined = true;
+            }
+        }
+        for (const auto &user : group.membership_requests)
+            refresh_membership(group, user.first);
     }
 }
 
@@ -682,7 +818,7 @@ std::string handle_command(const std::string &cmd_raw, bool is_sync, std::string
         std::string username = tokens[2];
         std::string request_id = tokens.size() >= 4 ? tokens[3] :
             (is_sync ? "legacy:" + group_id + ":" + username : new_session_token());
-        if (state.join_group(group_id, username, request_id, is_sync)) {
+        if (state.join_group(group_id, username, request_id, command_clock(is_sync), is_sync)) {
             state.save_to_file(state_file);
             if (!is_sync) queue_sync("JOIN_GROUP " + group_id + " " + username + " " + request_id);
             return "SUCCESS";
@@ -695,7 +831,7 @@ std::string handle_command(const std::string &cmd_raw, bool is_sync, std::string
         std::string username = tokens[2];
         std::string request_id = tokens.size() >= 4 ? tokens[3] :
             state.approved_request_id(group_id, username);
-        if (state.leave_group(group_id, username, request_id, is_sync)) {
+        if (state.leave_group(group_id, username, request_id, command_clock(is_sync), is_sync)) {
             state.save_to_file(state_file);
             if (!is_sync) queue_sync("LEAVE_GROUP " + group_id + " " + username + " " + request_id);
             return "SUCCESS";
@@ -734,7 +870,8 @@ std::string handle_command(const std::string &cmd_raw, bool is_sync, std::string
         std::string owner_id = tokens[3];
         std::string request_id = tokens.size() >= 5 ? tokens[4] :
             state.pending_request_id(group_id, username);
-        if (state.accept_request(group_id, username, owner_id, request_id, is_sync)) {
+        if (state.accept_request(group_id, username, owner_id, request_id,
+                                 command_clock(is_sync), is_sync)) {
             state.save_to_file(state_file);
             if (!is_sync) queue_sync("ACCEPT_REQUEST " + group_id + " " + username + " " + owner_id + " " + request_id);
             return "SUCCESS";
@@ -869,28 +1006,26 @@ void client_handler(int client_fd) {
                 Utils::send_msg(client_fd, "ERROR sync authentication required");
                 break;
             }
-            size_t separator = request.find(' ', 8);
-            if (separator == std::string::npos) {
+            JournalEntry entry;
+            if (!parse_wire_operation(request, entry)) {
                 Utils::send_msg(client_fd, "SYNC_NACK");
                 continue;
             }
-            std::string id = request.substr(8, separator - 8);
-            std::string cmd = request.substr(separator + 1);
-            bool applied = apply_remote_operation(id, cmd);
-            Utils::send_msg(client_fd, (applied ? "SYNC_ACK " : "SYNC_NACK ") + id);
+            bool applied = apply_remote_operation(entry);
+            Utils::send_msg(client_fd, (applied ? "SYNC_ACK " : "SYNC_NACK ") + entry.id);
         }
         else if (request == "SYNC_PULL") {
             if (!sync_authenticated) {
                 Utils::send_msg(client_fd, "ERROR sync authentication required");
                 break;
             }
-            std::vector<std::pair<std::string, std::string>> snapshot;
+            std::vector<JournalEntry> snapshot;
             {
                 std::lock_guard<std::mutex> lock(journal_mtx);
                 snapshot = journal;
             }
             for (const auto &entry : snapshot) {
-                if (!Utils::send_msg(client_fd, "SYNC_OP " + entry.first + " " + entry.second))
+                if (!Utils::send_msg(client_fd, wire_operation(entry)))
                     break;
             }
             Utils::send_msg(client_fd, "SYNC_END");
@@ -982,7 +1117,8 @@ int main(int argc, char *argv[]) {
     if (!have_snapshot) {
         for (const auto &entry : journal) {
             std::string ignored;
-            handle_command(entry.second, true, ignored);
+            incoming_clock = entry.clock;
+            handle_command(entry.command, true, ignored);
         }
     }
 

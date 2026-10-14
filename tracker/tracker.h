@@ -6,6 +6,8 @@
 #include <unordered_map>
 #include <set>
 #include <map>
+#include <array>
+#include <cstdint>
 #include <mutex>
 #include <iostream>
 
@@ -18,6 +20,15 @@ struct User {
     int client_port = 0;
 };
 
+using VectorClock = std::array<uint64_t, 2>;
+
+struct MembershipRequest {
+    bool joined = false;
+    VectorClock join_clock{};
+    bool approved = false;
+    VectorClock approval_clock{};
+};
+
 struct Group {
     std::string group_id;
     std::string owner_id;
@@ -28,6 +39,8 @@ struct Group {
     std::map<std::string, std::string> request_ids;
     std::map<std::string, std::string> approved_ids;
     std::set<std::string> revoked_ids;
+    std::map<std::string, std::map<std::string, MembershipRequest>> membership_requests;
+    std::map<std::string, std::map<std::string, VectorClock>> removal_clocks;
 };
 
 struct SharedFile {
@@ -56,14 +69,14 @@ public:
                             const std::string &seeder);
     bool create_group(const std::string &group_id, const std::string &owner_id);
     bool join_group(const std::string &group_id, const std::string &username,
-                    const std::string &request_id, bool is_sync);
+                    const std::string &request_id, const VectorClock &clock, bool is_sync);
     bool leave_group(const std::string &group_id, const std::string &username,
-                     const std::string &request_id, bool is_sync);
+                     const std::string &request_id, const VectorClock &clock, bool is_sync);
     std::vector<std::string> list_groups();
     std::vector<std::string> list_requests(const std::string &group_id, const std::string &owner_id, bool &is_owner);
     bool accept_request(const std::string &group_id, const std::string &username,
                         const std::string &owner_id, const std::string &request_id,
-                        bool is_sync);
+                        const VectorClock &clock, bool is_sync);
     std::string pending_request_id(const std::string &group_id, const std::string &username);
     std::string approved_request_id(const std::string &group_id, const std::string &username);
     bool upload_file(const std::string &group_id, const std::string &username, const std::string &file_name, size_t file_size, const std::string &file_sha1, const std::vector<std::string> &piece_sha1s);
